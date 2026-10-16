@@ -1,5 +1,7 @@
 #Requires -Version 5.1
-#Requires -RunAsAdministrator
+# NOTE: there is deliberately no "#Requires -RunAsAdministrator" here. PowerShell would
+# reject the script with a raw, hard-to-read error before any of our code runs.
+# Assert-Administrator / Assert-HyperV below do the same job with actionable messages.
 <#
 .SYNOPSIS
     One-command Ansible home lab on Hyper-V (a "minikube" for Ansible).
@@ -13,6 +15,10 @@
     delete) and the same flags where they make sense. Both "--nodes 3" and
     "--nodes=3" work.
 
+    Prerequisites are checked up front, with clear "how to fix" steps instead of
+    stack traces: Administrator rights, Hyper-V enabled, the hypervisor running,
+    the Hyper-V management service (vmms) running, and the required tools.
+
     Networking: the script creates its own internal Hyper-V switch + NAT and
     gives every VM a FIXED IP (static, via cloud-init network-config):
 
@@ -22,13 +28,13 @@
         172.16.10.4   lab-node2   ...and so on
 
 .EXAMPLE
-    .\lab.ps1 start                          # 3 nodes: control + 2 workers
-    .\lab.ps1 start --nodes 4 --memory 2g
-    .\lab.ps1 start --subnet 10.77.5.0/24    # use another /24
-    .\lab.ps1 status
-    .\lab.ps1 ssh -n node1
-    .\lab.ps1 stop
-    .\lab.ps1 delete --purge
+    .\ansibox.ps1 start                          # 3 nodes: control + 2 workers
+    .\ansibox.ps1 start --nodes 4 --memory 2g
+    .\ansibox.ps1 start --subnet 10.77.5.0/24    # use another /24
+    .\ansibox.ps1 status
+    .\ansibox.ps1 ssh -n node1
+    .\ansibox.ps1 stop
+    .\ansibox.ps1 delete --purge
 #>
 
 Set-StrictMode -Version Latest
@@ -102,7 +108,7 @@ for ($i = 0; $i -lt $tokens.Count; $i++) {
 
     if ($dashes -eq '--') { $long = $name }
     elseif ($ShortFlags.ContainsKey($name)) { $long = $ShortFlags[$name] }
-    else { throw "Unknown flag '$t'. Try: .\lab.ps1 help" }
+    else { throw "Unknown flag '$t'. Try: .\ansibox.ps1 help" }
 
     if ($SwitchFlags -contains $long) { $Flags[$long] = $true }
     elseif ($ValueFlags -contains $long) {
@@ -113,7 +119,7 @@ for ($i = 0; $i -lt $tokens.Count; $i++) {
         }
         $Flags[$long] = $val
     }
-    else { throw "Unknown flag '$t'. Try: .\lab.ps1 help" }
+    else { throw "Unknown flag '$t'. Try: .\ansibox.ps1 help" }
 }
 
 # ---- flags -> the variables the rest of the script uses
@@ -177,12 +183,12 @@ function Show-Usage {
 @"
 Ansible lab on Hyper-V
 
-  .\lab.ps1 start   [--nodes 3] [--memory 1024] [--cpus 2] [--disk-size 10g]
+  .\ansibox.ps1 start   [--nodes 3] [--memory 1024] [--cpus 2] [--disk-size 10g]
                      [--subnet 172.16.10.0/24] [--dns 1.1.1.1,8.8.8.8]
-  .\lab.ps1 status
-  .\lab.ps1 ssh     [-n control|node1|node2|...]
-  .\lab.ps1 stop
-  .\lab.ps1 delete  [--purge] [--force]
+  .\ansibox.ps1 status
+  .\ansibox.ps1 ssh     [-n control|node1|node2|...]
+  .\ansibox.ps1 stop
+  .\ansibox.ps1 delete  [--purge] [--force]
 
 Global flag:  -p, --profile <name>   lab name / VM prefix (default: lab)
 Sizes:        2048 = 2048mb = 2g (a bare number is MB, as in minikube)
@@ -198,20 +204,148 @@ Lab data lives in: $LabPath
 "@ | Write-Host
 }
 
-function Test-Prerequisites {
-    Write-Step 'Checking prerequisites'
-    if (-not (Get-Command New-VM -ErrorAction SilentlyContinue)) {
-        throw "Hyper-V PowerShell module not found. Enable it with:`n  Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All`nthen reboot."
+# ------------------------------------------------------ prerequisite checks
+# Every failed check goes through Stop-Prereq: a one-line problem plus numbered
+# "How to fix" steps. The trap at the top prints it as a single red "X ..." message,
+# never a PowerShell stack trace.
+function Stop-Prereq([string]$Problem, [string[]]$Fix = @()) {
+    $msg = $Problem
+    if ($Fix.Count -gt 0) {
+        $msg += "`n`n  How to fix:"
+        $i = 1
+        foreach ($f in $Fix) { $msg += "`n    $i. $f"; $i++ }
     }
-    if (-not (Get-Command New-NetNat -ErrorAction SilentlyContinue)) {
-        throw 'NetNat cmdlets (New-NetNat) not found - needed to give the lab internet access.'
+    throw $msg
+}
+
+function Test-IsAdministrator {
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Assert-Administrator {
+    if (-not (Test-IsAdministrator)) {
+        Stop-Prereq 'AnsiBox must be run as Administrator (creating VMs, virtual switches and NAT requires it).' @(
+            'Close this window and open PowerShell as Administrator: right-click Start, then choose "Terminal (Admin)" or "Windows PowerShell (Admin)".',
+            "Go back to this folder and re-run:  .\ansibox.ps1 $Command"
+        )
     }
-    foreach ($t in 'ssh', 'scp', 'ssh-keygen', 'curl.exe') {
-        if (-not (Get-Command $t -ErrorAction SilentlyContinue)) {
-            throw "'$t' not found. Install the Windows OpenSSH Client (Settings > Optional features)."
+}
+
+# Is Hyper-V installed, is the hypervisor actually running, is the management service up,
+# and can we talk to it? Each step stops with a specific, actionable message.
+function Assert-HyperV {
+    Write-Step 'Checking Hyper-V'
+    $enableFeature = 'Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All'
+
+    # 1. Edition / feature state
+    $feature = $null
+    try { $feature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop } catch { }
+
+    if ($null -eq $feature) {
+        # Could not query the feature. Windows Home is the one case we can name for sure.
+        $edition = ''
+        try { $edition = [string](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption } catch { }
+        if ($edition -match 'Home') {
+            Stop-Prereq "This PC runs '$edition', which does not include Hyper-V." @(
+                'Upgrade to Windows 10/11 Pro, Enterprise or Education.',
+                'Hyper-V cannot be enabled on Windows Home editions.'
+            )
+        }
+        # Otherwise don't block on the query alone; the checks below catch a missing Hyper-V.
+    }
+    else {
+        $state = [string]$feature.State
+        if ($state -eq 'EnablePending') {
+            Stop-Prereq 'Hyper-V was enabled but Windows has not finished installing it - a restart is pending.' @(
+                'Restart the PC.',
+                "Re-run:  .\ansibox.ps1 $Command"
+            )
+        }
+        if ($state -ne 'Enabled') {
+            Stop-Prereq 'Hyper-V is not enabled on this PC.' @(
+                "Run in this elevated PowerShell:  $enableFeature",
+                'Restart the PC when prompted.',
+                'Make sure virtualization (Intel VT-x / AMD-V) is turned on in your BIOS/UEFI settings.',
+                "Re-run:  .\ansibox.ps1 $Command"
+            )
         }
     }
-    Write-Ok 'Hyper-V, NetNat and OpenSSH client OK'
+
+    # 2. The hypervisor itself must be running (needs a reboot after enabling the feature)
+    $hypervisorPresent = $null
+    try { $hypervisorPresent = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).HypervisorPresent } catch { }
+    if ($hypervisorPresent -eq $false) {
+        Stop-Prereq 'Hyper-V is installed, but the hypervisor is not running.' @(
+            'Restart the PC - Windows needs a reboot after Hyper-V is enabled.',
+            'If it still fails after a restart, check the boot setting:  bcdedit /enum | findstr hypervisorlaunchtype  (it should say Auto). Fix with:  bcdedit /set hypervisorlaunchtype auto  and restart.',
+            'Make sure virtualization (Intel VT-x / AMD-V) is enabled in your BIOS/UEFI settings.'
+        )
+    }
+
+    # 3. The Hyper-V Virtual Machine Management service
+    $svc = Get-Service -Name vmms -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Stop-Prereq 'The Hyper-V Virtual Machine Management service (vmms) was not found.' @(
+            "Run in this elevated PowerShell:  $enableFeature",
+            'Restart the PC, then re-run this command.'
+        )
+    }
+    if ($svc.Status -ne 'Running') {
+        Write-Warn2 'Hyper-V Virtual Machine Management service is stopped - starting it'
+        try {
+            Start-Service -Name vmms -ErrorAction Stop
+            $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+        } catch {
+            Stop-Prereq "Could not start the Hyper-V Virtual Machine Management service: $($_.Exception.Message)" @(
+                'Try starting it yourself:  Start-Service vmms',
+                'Inspect it with:  Get-Service vmms | Format-List *',
+                'If you just enabled Hyper-V, restart the PC and try again.'
+            )
+        }
+    }
+
+    # 4. PowerShell module
+    if (-not (Get-Command New-VM -ErrorAction SilentlyContinue)) {
+        Stop-Prereq 'The Hyper-V PowerShell module is not installed.' @(
+            'Run in this elevated PowerShell:  Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Management-PowerShell',
+            'Open a new elevated PowerShell window and re-run this command.'
+        )
+    }
+
+    # 5. Can we actually talk to Hyper-V?
+    try { $null = Get-VM -ErrorAction Stop }
+    catch {
+        Stop-Prereq "Cannot talk to Hyper-V: $($_.Exception.Message)" @(
+            'Make sure this is an elevated (Administrator) PowerShell window.',
+            'If you just enabled Hyper-V, restart the PC.',
+            'Check the service:  Get-Service vmms'
+        )
+    }
+    Write-Ok 'Hyper-V is enabled and running'
+}
+
+# Tooling needed only by 'start' when it builds a lab: NAT cmdlets, OpenSSH client, curl.
+function Test-Prerequisites {
+    Write-Step 'Checking prerequisites'
+    if (-not (Get-Command New-NetNat -ErrorAction SilentlyContinue)) {
+        Stop-Prereq 'NetNat cmdlets (New-NetNat) not found - they give the lab its internet access.' @(
+            'Check that the module exists:  Get-Module -ListAvailable NetNat',
+            'Use a supported Windows 10/11 Pro, Enterprise or Education edition with Hyper-V enabled.'
+        )
+    }
+    $missing = @('ssh', 'scp', 'ssh-keygen', 'curl.exe') |
+               Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
+    if ($missing) {
+        Stop-Prereq "Required tool(s) not found: $($missing -join ', ')." @(
+            'Install the Windows OpenSSH Client: Settings > System > Optional features > Add a feature > "OpenSSH Client".',
+            'Or from an elevated PowerShell:  Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0',
+            'curl.exe ships with Windows 10 (1803+) and 11 - run Windows Update if it is missing.',
+            'Open a new PowerShell window afterwards so the updated PATH is picked up.'
+        )
+    }
+    Write-Ok 'NetNat and OpenSSH client OK'
 }
 
 # --- fixed addressing ------------------------------------------------------
@@ -258,7 +392,7 @@ function Initialize-LabNetwork {
     $mine = $nats | Where-Object { $_.Name -eq $NatName }
     if ($mine) {
         if ($mine.InternalIPInterfaceAddressPrefix -ne $cidr) {
-            throw "NAT '$NatName' exists for $($mine.InternalIPInterfaceAddressPrefix), not $cidr. Run '.\lab.ps1 delete' first."
+            throw "NAT '$NatName' exists for $($mine.InternalIPInterfaceAddressPrefix), not $cidr. Run '.\ansibox.ps1 delete' first."
         }
     } else {
         if ($nats.Count -gt 0) {
@@ -478,7 +612,7 @@ function New-LabVm([string]$Name, [bool]$IsControl) {
     if (Get-VM -Name $Name -ErrorAction SilentlyContinue) {
         $sn = (Get-VMNetworkAdapter -VMName $Name | Select-Object -First 1).SwitchName
         if ($sn -ne $SwitchName) {
-            Write-Warn2 "$Name exists but is on switch '$sn' (expected '$SwitchName'). Run '.\lab.ps1 delete' and then 'start' to rebuild it with a fixed IP."
+            Write-Warn2 "$Name exists but is on switch '$sn' (expected '$SwitchName'). Run '.\ansibox.ps1 delete' and then 'start' to rebuild it with a fixed IP."
         } else {
             Write-Warn2 "$Name already exists - keeping it"
         }
@@ -622,15 +756,15 @@ function Invoke-Up {
 
     Write-Host ''
     Write-Host 'Lab is ready.' -ForegroundColor Green
-    Write-Host "  Connect:   .\lab.ps1 ssh      (or: ssh -i `"$KeyPath`" $LabUser@$($ips[$control]))"
+    Write-Host "  Connect:   .\ansibox.ps1 ssh      (or: ssh -i `"$KeyPath`" $LabUser@$($ips[$control]))"
     Write-Host "  Then run:  cd ~/lab && ansible all -m ping"
     Write-Host "             ansible-playbook site.yml"
-    Write-Host "  Tear down: .\lab.ps1 delete"
+    Write-Host "  Tear down: .\ansibox.ps1 delete"
 }
 
 function Invoke-Status {
     $vms = Get-LabVms
-    if (-not $vms) { Write-Host 'No lab VMs found. Run: .\lab.ps1 start'; return }
+    if (-not $vms) { Write-Host 'No lab VMs found. Run: .\ansibox.ps1 start'; return }
     $vms | ForEach-Object {
         [pscustomobject]@{
             Name     = $_.Name
@@ -643,11 +777,17 @@ function Invoke-Status {
 }
 
 function Invoke-SshAction {
+    if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+        Stop-Prereq "The 'ssh' client was not found." @(
+            'Install the Windows OpenSSH Client: Settings > System > Optional features > Add a feature > "OpenSSH Client".',
+            'Open a new PowerShell window afterwards so the updated PATH is picked up.'
+        )
+    }
     $name = $Target
     if ($name -notlike "$Prefix-*") { $name = "$Prefix-$name" }
     $vm = Get-VM -Name $name -ErrorAction SilentlyContinue
-    if (-not $vm) { throw "VM '$name' not found. Try: .\lab.ps1 status" }
-    if ($vm.State -ne 'Running') { throw "$name is not running. Try: .\lab.ps1 start" }
+    if (-not $vm) { throw "VM '$name' not found. Try: .\ansibox.ps1 status" }
+    if ($vm.State -ne 'Running') { throw "$name is not running. Try: .\ansibox.ps1 start" }
     $ip = Get-LabIp $name
     Clear-KnownHost $ip
     & ssh @BaseOpts "$LabUser@$ip"
@@ -697,6 +837,16 @@ function Invoke-StartCmd {
 # --------------------------------------------------------------------- main
 if ($Flags.ContainsKey('help')) { $Command = 'help' }
 
+if (@('start', 'stop', 'status', 'ssh', 'delete', 'help') -notcontains $Command) {
+    throw "Unknown command '$Command'. Try: .\ansibox.ps1 help"
+}
+
+# 'help' works anywhere. Everything else needs Administrator rights and a working Hyper-V.
+if ($Command -ne 'help') {
+    Assert-Administrator
+    Assert-HyperV
+}
+
 switch ($Command) {
     'start'  { Invoke-StartCmd }
     'status' { Invoke-Status }
@@ -704,5 +854,5 @@ switch ($Command) {
     'stop'   { Get-LabVms | Where-Object State -eq 'Running' | Stop-VM; Write-Ok 'Stopped.' }
     'delete' { Invoke-Destroy }
     'help'   { Show-Usage }
-    default  { throw "Unknown command '$Command'. Try: .\lab.ps1 help" }
+    default  { throw "Unknown command '$Command'. Try: .\ansibox.ps1 help" }
 }
