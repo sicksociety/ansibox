@@ -2,12 +2,16 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    One-command Ansible home lab on Hyper-V (a "minikube start" for Ansible).
+    One-command Ansible home lab on Hyper-V (a "minikube" for Ansible).
 
 .DESCRIPTION
-    Builds a control node (Ansible preinstalled) plus N worker nodes from the
+    Builds a control node (Ansible preinstalled) plus worker nodes from the
     official Debian 13 "genericcloud" image. Every VM is a differencing disk on
     one shared base image, so extra nodes cost almost no disk space.
+
+    The command line copies minikube: same verbs (start, stop, status, ssh,
+    delete) and the same flags where they make sense. Both "--nodes 3" and
+    "--nodes=3" work.
 
     Networking: the script creates its own internal Hyper-V switch + NAT and
     gives every VM a FIXED IP (static, via cloud-init network-config):
@@ -18,45 +22,130 @@
         172.16.10.4   lab-node2   ...and so on
 
 .EXAMPLE
-    .\lab.ps1 up                     # control + 2 workers
-    .\lab.ps1 up -Workers 3 -MemoryMB 2048
-    .\lab.ps1 up -Subnet 10.77.5     # use another /24
+    .\lab.ps1 start                          # 3 nodes: control + 2 workers
+    .\lab.ps1 start --nodes 4 --memory 2g
+    .\lab.ps1 start --subnet 10.77.5.0/24    # use another /24
     .\lab.ps1 status
-    .\lab.ps1 ssh control
-    .\lab.ps1 destroy
+    .\lab.ps1 ssh -n node1
+    .\lab.ps1 stop
+    .\lab.ps1 delete --purge
 #>
-[CmdletBinding()]
-param(
-    [Parameter(Position = 0)]
-    [ValidateSet('up', 'status', 'ssh', 'stop', 'start', 'destroy', 'help')]
-    [string]$Action = 'help',
-
-    # For 'ssh': which node to connect to (control, node1, node2, ...)
-    [Parameter(Position = 1)]
-    [string]$Target = 'control',
-
-    [ValidateRange(1, 10)] [int]$Workers = 2,
-    [ValidateRange(512, 16384)] [int]$MemoryMB = 1024,
-    [ValidateRange(1, 8)] [int]$Cpus = 2,
-    [ValidateRange(4, 200)] [int]$DiskGB = 10,
-
-    [string]$LabPath = (Join-Path $env:USERPROFILE 'ansible-lab'),
-    [string]$Prefix = 'lab',
-
-    # First three octets of the lab /24. .1 = host gateway, .2 = control, .3+ = nodes
-    [ValidatePattern('^\d{1,3}\.\d{1,3}\.\d{1,3}$')]
-    [string]$Subnet = '172.16.10',
-
-    # DNS servers handed to the VMs (the internal switch has no DHCP/DNS of its own)
-    [string[]]$Dns = @('1.1.1.1', '8.8.8.8'),
-
-    # destroy: skip confirmation / also delete keys and the cached image
-    [switch]$Force,
-    [switch]$Purge
-)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Print errors the way minikube does ("X message") instead of a PowerShell stack trace.
+trap { Write-Host "X $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
+
+# ------------------------------------------------- minikube-style command line
+# PowerShell's param() can't bind GNU-style "--flag value", so $args is parsed by hand.
+# Accepted forms:  --nodes 3   --nodes=3   -n 3     (switches: --purge, --force / -f)
+function Get-Flag([string]$Name, $Default) {
+    if ($Flags.ContainsKey($Name)) { return $Flags[$Name] }
+    return $Default
+}
+
+function ConvertTo-Int([string]$Text, [string]$Flag) {
+    $n = 0
+    if (-not [int]::TryParse($Text, [ref]$n)) { throw "--$Flag expects a number, got '$Text'." }
+    return $n
+}
+
+# minikube size format: <number>[b|k|m|g], optional trailing "b". A bare number is MB.
+#   2048 = 2048mb = 2g = 2gb
+# Gotcha: PowerShell itself turns an unquoted "2gb" / "512mb" into a plain byte count
+# (2147483648 / 536870912) before the script sees it. No valid size in MB has 7+ digits,
+# so a bare number that long is treated as bytes.
+function ConvertTo-MB([string]$Text, [string]$Flag) {
+    if ($Text -match '^\d{7,}$') { return [int][math]::Ceiling([double]$Text / 1MB) }
+    if (-not ($Text -match '^(\d+(?:\.\d+)?)([bkmg]?)b?$')) {
+        throw "--$Flag '$Text' is not a size. Use e.g. 2048, 2048mb or 2g."
+    }
+    $n  = [double]$Matches[1]
+    $mb = switch ($Matches[2].ToLower()) {
+        'b'     { $n / 1MB }
+        'k'     { $n / 1KB }
+        'g'     { $n * 1024 }
+        default { $n }
+    }
+    return [int][math]::Ceiling($mb)
+}
+
+function Assert-Range([string]$Flag, [int]$Value, [int]$Min, [int]$Max, [string]$Unit = '') {
+    if ($Value -lt $Min -or $Value -gt $Max) {
+        throw ("--$Flag must be between $Min and $Max {0}(got $Value)." -f $(if ($Unit) { "$Unit " } else { '' }))
+    }
+}
+
+$ValueFlags  = 'nodes', 'node', 'memory', 'cpus', 'disk-size', 'subnet', 'dns', 'profile'
+$SwitchFlags = 'force', 'purge', 'help'
+# Short flags. As in minikube, -n is --nodes for 'start' but --node for 'ssh'.
+$ShortFlags  = @{ p = 'profile'; f = 'force'; h = 'help'; n = 'nodes' }
+
+$tokens  = @($args | ForEach-Object { "$_" })
+$Command = 'help'
+if ($tokens.Count -gt 0 -and $tokens[0] -notlike '-*') {
+    $Command = $tokens[0].ToLower()
+    $tokens  = @($tokens | Select-Object -Skip 1)
+}
+$CommandAliases = @{ up = 'start'; destroy = 'delete' }     # old names still work
+if ($CommandAliases.ContainsKey($Command)) { $Command = $CommandAliases[$Command] }
+if ($Command -eq 'ssh') { $ShortFlags['n'] = 'node' }
+
+$Flags = @{}
+$Rest  = @()
+for ($i = 0; $i -lt $tokens.Count; $i++) {
+    $t = $tokens[$i]
+    if ($t -notmatch '^(--?)([A-Za-z][\w-]*)(?:=(.*))?$') { $Rest += $t; continue }
+
+    $dashes = $Matches[1]; $name = $Matches[2]
+    $val    = if ($Matches.ContainsKey(3)) { $Matches[3] } else { $null }
+
+    if ($dashes -eq '--') { $long = $name }
+    elseif ($ShortFlags.ContainsKey($name)) { $long = $ShortFlags[$name] }
+    else { throw "Unknown flag '$t'. Try: .\lab.ps1 help" }
+
+    if ($SwitchFlags -contains $long) { $Flags[$long] = $true }
+    elseif ($ValueFlags -contains $long) {
+        if ($null -eq $val) {
+            if ($i + 1 -ge $tokens.Count) { throw "Flag --$long needs a value." }
+            $i++
+            $val = $tokens[$i]
+        }
+        $Flags[$long] = $val
+    }
+    else { throw "Unknown flag '$t'. Try: .\lab.ps1 help" }
+}
+
+# ---- flags -> the variables the rest of the script uses
+$Nodes    = ConvertTo-Int (Get-Flag 'nodes' 3) 'nodes'          # total, control included (like minikube)
+$Cpus     = ConvertTo-Int (Get-Flag 'cpus' 2) 'cpus'
+$MemoryMB = ConvertTo-MB  (Get-Flag 'memory' 1024) 'memory'
+$DiskGB   = [int][math]::Ceiling((ConvertTo-MB (Get-Flag 'disk-size' '10g') 'disk-size') / 1024)
+Assert-Range 'nodes'     $Nodes    2   11
+Assert-Range 'cpus'      $Cpus     1   8
+Assert-Range 'memory'    $MemoryMB 512 16384 'MB'
+Assert-Range 'disk-size' $DiskGB   4   200   'GB'
+$Workers = $Nodes - 1
+
+# --profile = the lab's name; it prefixes every VM (lab-control, lab-node1, ...)
+$Prefix = [string](Get-Flag 'profile' 'lab')
+if ($Prefix -notmatch '^[A-Za-z0-9]+$') { throw '--profile may only contain letters and digits.' }
+
+# First three octets of the lab /24. .1 = host gateway, .2 = control, .3+ = nodes
+$subnetText = [string](Get-Flag 'subnet' '172.16.10')
+if ($subnetText -match '^(\d{1,3}\.\d{1,3}\.\d{1,3})(?:\.0/24)?$') { $Subnet = $Matches[1] }
+else { throw "--subnet must be a /24 such as 10.77.5.0/24 (got '$subnetText')." }
+
+# DNS servers handed to the VMs (the internal switch has no DHCP/DNS of its own)
+[string[]]$Dns = @((Get-Flag 'dns' '1.1.1.1,8.8.8.8') -split '[,\s]+' | Where-Object { $_ })
+
+# Like MINIKUBE_HOME: set LAB_HOME to keep the lab somewhere else
+$LabPath = if ($env:LAB_HOME) { $env:LAB_HOME } else { Join-Path $env:USERPROFILE 'ansible-lab' }
+
+$Force  = $Flags.ContainsKey('force')
+$Purge  = $Flags.ContainsKey('purge')
+# For 'ssh': which node to connect to (control, node1, node2, ...)
+$Target = if ($Flags.ContainsKey('node')) { $Flags['node'] } elseif ($Rest.Count -gt 0) { $Rest[0] } else { 'control' }
 
 # ---------------------------------------------------------------- constants
 $ImageBase = 'https://cloud.debian.org/images/cloud/trixie/latest'
@@ -88,11 +177,19 @@ function Show-Usage {
 @"
 Ansible lab on Hyper-V
 
-  .\lab.ps1 up [-Workers 2] [-MemoryMB 1024] [-Cpus 2] [-DiskGB 10] [-Subnet 172.16.10]
+  .\lab.ps1 start   [--nodes 3] [--memory 1024] [--cpus 2] [--disk-size 10g]
+                     [--subnet 172.16.10.0/24] [--dns 1.1.1.1,8.8.8.8]
   .\lab.ps1 status
-  .\lab.ps1 ssh [control|node1|node2|...]
-  .\lab.ps1 stop | start
-  .\lab.ps1 destroy [-Force] [-Purge]
+  .\lab.ps1 ssh     [-n control|node1|node2|...]
+  .\lab.ps1 stop
+  .\lab.ps1 delete  [--purge] [--force]
+
+Global flag:  -p, --profile <name>   lab name / VM prefix (default: lab)
+Sizes:        2048 = 2048mb = 2g (a bare number is MB, as in minikube)
+--nodes:      total node count, control included (3 = control + 2 workers)
+start:        creates the lab if it doesn't exist, otherwise just starts it again
+              (pass --nodes to force a re-run that adds missing nodes)
+Env:          LAB_HOME  where the lab data lives (like MINIKUBE_HOME)
 
 Fixed IPs:  $Subnet.1 host/gateway, $Subnet.2 control, $Subnet.3 node1, $Subnet.4 node2, ...
 
@@ -150,7 +247,7 @@ function Initialize-LabNetwork {
         $clash = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
                  Where-Object { $_.IPAddress -like "$Subnet.*" -and $_.InterfaceAlias -ne $alias }
         if ($clash) {
-            throw "Subnet $Subnet.0/24 is already in use on this machine (interface '$(@($clash)[0].InterfaceAlias)'). Pick another with -Subnet."
+            throw "Subnet $Subnet.0/24 is already in use on this machine (interface '$(@($clash)[0].InterfaceAlias)'). Pick another with --subnet."
         }
         Write-Step "Assigning $GatewayIp/$NetPrefix to the host adapter"
         New-NetIPAddress -InterfaceAlias $alias -IPAddress $GatewayIp -PrefixLength $NetPrefix | Out-Null
@@ -161,11 +258,11 @@ function Initialize-LabNetwork {
     $mine = $nats | Where-Object { $_.Name -eq $NatName }
     if ($mine) {
         if ($mine.InternalIPInterfaceAddressPrefix -ne $cidr) {
-            throw "NAT '$NatName' exists for $($mine.InternalIPInterfaceAddressPrefix), not $cidr. Run '.\lab.ps1 destroy' first."
+            throw "NAT '$NatName' exists for $($mine.InternalIPInterfaceAddressPrefix), not $cidr. Run '.\lab.ps1 delete' first."
         }
     } else {
         if ($nats.Count -gt 0) {
-            throw "Another NAT already exists ('$($nats[0].Name)', $($nats[0].InternalIPInterfaceAddressPrefix)). Windows supports only one NAT network per host. Remove it (Remove-NetNat -Name '$($nats[0].Name)') or reuse it with a matching -Subnet / -Prefix."
+            throw "Another NAT already exists ('$($nats[0].Name)', $($nats[0].InternalIPInterfaceAddressPrefix)). Windows supports only one NAT network per host. Remove it (Remove-NetNat -Name '$($nats[0].Name)') or reuse it with a matching --subnet / --profile."
         }
         Write-Step "Creating NAT '$NatName' for $cidr"
         New-NetNat -Name $NatName -InternalIPInterfaceAddressPrefix $cidr | Out-Null
@@ -238,7 +335,7 @@ function Repair-VhdxFile([string]$Path) {
         $attr = (Get-Item -LiteralPath $Path).Attributes
     }
     if ((($attr -band $sparse) -ne 0) -or (($attr -band $comp) -ne 0) -or (($attr -band $enc) -ne 0)) {
-        throw "'$Path' is still sparse/compressed/encrypted. Move -LabPath to a plain NTFS folder (not compressed or encrypted) and retry."
+        throw "'$Path' is still sparse/compressed/encrypted. Set LAB_HOME to a plain NTFS folder (not compressed or encrypted) and retry."
     }
 }
 
@@ -381,7 +478,7 @@ function New-LabVm([string]$Name, [bool]$IsControl) {
     if (Get-VM -Name $Name -ErrorAction SilentlyContinue) {
         $sn = (Get-VMNetworkAdapter -VMName $Name | Select-Object -First 1).SwitchName
         if ($sn -ne $SwitchName) {
-            Write-Warn2 "$Name exists but is on switch '$sn' (expected '$SwitchName'). Run '.\lab.ps1 destroy' and then 'up' to rebuild it with a fixed IP."
+            Write-Warn2 "$Name exists but is on switch '$sn' (expected '$SwitchName'). Run '.\lab.ps1 delete' and then 'start' to rebuild it with a fixed IP."
         } else {
             Write-Warn2 "$Name already exists - keeping it"
         }
@@ -525,15 +622,15 @@ function Invoke-Up {
 
     Write-Host ''
     Write-Host 'Lab is ready.' -ForegroundColor Green
-    Write-Host "  Connect:   .\lab.ps1 ssh control      (or: ssh -i `"$KeyPath`" $LabUser@$($ips[$control]))"
+    Write-Host "  Connect:   .\lab.ps1 ssh      (or: ssh -i `"$KeyPath`" $LabUser@$($ips[$control]))"
     Write-Host "  Then run:  cd ~/lab && ansible all -m ping"
     Write-Host "             ansible-playbook site.yml"
-    Write-Host "  Tear down: .\lab.ps1 destroy"
+    Write-Host "  Tear down: .\lab.ps1 delete"
 }
 
 function Invoke-Status {
     $vms = Get-LabVms
-    if (-not $vms) { Write-Host 'No lab VMs found. Run: .\lab.ps1 up'; return }
+    if (-not $vms) { Write-Host 'No lab VMs found. Run: .\lab.ps1 start'; return }
     $vms | ForEach-Object {
         [pscustomobject]@{
             Name     = $_.Name
@@ -591,13 +688,21 @@ function Invoke-Start {
     Write-Ok 'Started.'
 }
 
+# minikube's "start" creates the cluster if it doesn't exist and resumes it if it does.
+# Resuming only powers the VMs on; it does not touch the files in ~/lab on the control node.
+function Invoke-StartCmd {
+    if ((Get-LabVms) -and -not $Flags.ContainsKey('nodes')) { Invoke-Start } else { Invoke-Up }
+}
+
 # --------------------------------------------------------------------- main
-switch ($Action) {
-    'up'      { Invoke-Up }
-    'status'  { Invoke-Status }
-    'ssh'     { Invoke-SshAction }
-    'stop'    { Get-LabVms | Where-Object State -eq 'Running' | Stop-VM; Write-Ok 'Stopped.' }
-    'start'   { Invoke-Start }
-    'destroy' { Invoke-Destroy }
-    default   { Show-Usage }
+if ($Flags.ContainsKey('help')) { $Command = 'help' }
+
+switch ($Command) {
+    'start'  { Invoke-StartCmd }
+    'status' { Invoke-Status }
+    'ssh'    { Invoke-SshAction }
+    'stop'   { Get-LabVms | Where-Object State -eq 'Running' | Stop-VM; Write-Ok 'Stopped.' }
+    'delete' { Invoke-Destroy }
+    'help'   { Show-Usage }
+    default  { throw "Unknown command '$Command'. Try: .\lab.ps1 help" }
 }
