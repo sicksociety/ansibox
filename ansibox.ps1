@@ -233,13 +233,14 @@ function Assert-Administrator {
     }
 }
 
-# Is Hyper-V installed, is the hypervisor actually running, is the management service up,
-# and can we talk to it? Each step stops with a specific, actionable message.
-function Assert-HyperV {
-    Write-Step 'Checking Hyper-V'
+# Explains WHY Hyper-V is unavailable: Windows Home, feature not enabled, or restart pending.
+# Get-WindowsOptionalFeature -Online goes through DISM and can take 10-60 seconds, so this is
+# only called AFTER a quick check has already failed - never on the healthy path.
+# It throws (through Stop-Prereq) when it finds the cause, and returns quietly otherwise so the
+# caller can report its own, more specific message.
+function Assert-HyperVFeature {
     $enableFeature = 'Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All'
 
-    # 1. Edition / feature state
     $feature = $null
     try { $feature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -ErrorAction Stop } catch { }
 
@@ -253,30 +254,38 @@ function Assert-HyperV {
                 'Hyper-V cannot be enabled on Windows Home editions.'
             )
         }
-        # Otherwise don't block on the query alone; the checks below catch a missing Hyper-V.
-    }
-    else {
-        $state = [string]$feature.State
-        if ($state -eq 'EnablePending') {
-            Stop-Prereq 'Hyper-V was enabled but Windows has not finished installing it - a restart is pending.' @(
-                'Restart the PC.',
-                "Re-run:  .\ansibox.ps1 $Command"
-            )
-        }
-        if ($state -ne 'Enabled') {
-            Stop-Prereq 'Hyper-V is not enabled on this PC.' @(
-                "Run in this elevated PowerShell:  $enableFeature",
-                'Restart the PC when prompted.',
-                'Make sure virtualization (Intel VT-x / AMD-V) is turned on in your BIOS/UEFI settings.',
-                "Re-run:  .\ansibox.ps1 $Command"
-            )
-        }
+        return
     }
 
-    # 2. The hypervisor itself must be running (needs a reboot after enabling the feature)
+    $state = [string]$feature.State
+    if ($state -eq 'EnablePending') {
+        Stop-Prereq 'Hyper-V was enabled but Windows has not finished installing it - a restart is pending.' @(
+            'Restart the PC.',
+            "Re-run:  .\ansibox.ps1 $Command"
+        )
+    }
+    if ($state -ne 'Enabled') {
+        Stop-Prereq 'Hyper-V is not enabled on this PC.' @(
+            "Run in this elevated PowerShell:  $enableFeature",
+            'Restart the PC when prompted.',
+            'Make sure virtualization (Intel VT-x / AMD-V) is turned on in your BIOS/UEFI settings.',
+            "Re-run:  .\ansibox.ps1 $Command"
+        )
+    }
+}
+
+# Is the hypervisor actually running, is the management service up, and can we talk to it?
+# These checks are quick. Only when one of them fails do we run the slow feature query
+# (Assert-HyperVFeature) to explain why. Each step stops with a specific, actionable message.
+function Assert-HyperV {
+    Write-Step 'Checking Hyper-V'
+    $enableFeature = 'Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All'
+
+    # 1. The hypervisor itself must be running (needs a reboot after enabling the feature)
     $hypervisorPresent = $null
     try { $hypervisorPresent = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).HypervisorPresent } catch { }
     if ($hypervisorPresent -eq $false) {
+        Assert-HyperVFeature    # not installed? restart pending? Windows Home? (slow, failure path only)
         Stop-Prereq 'Hyper-V is installed, but the hypervisor is not running.' @(
             'Restart the PC - Windows needs a reboot after Hyper-V is enabled.',
             'If it still fails after a restart, check the boot setting:  bcdedit /enum | findstr hypervisorlaunchtype  (it should say Auto). Fix with:  bcdedit /set hypervisorlaunchtype auto  and restart.',
@@ -284,9 +293,10 @@ function Assert-HyperV {
         )
     }
 
-    # 3. The Hyper-V Virtual Machine Management service
+    # 2. The Hyper-V Virtual Machine Management service
     $svc = Get-Service -Name vmms -ErrorAction SilentlyContinue
     if (-not $svc) {
+        Assert-HyperVFeature
         Stop-Prereq 'The Hyper-V Virtual Machine Management service (vmms) was not found.' @(
             "Run in this elevated PowerShell:  $enableFeature",
             'Restart the PC, then re-run this command.'
@@ -298,7 +308,9 @@ function Assert-HyperV {
             Start-Service -Name vmms -ErrorAction Stop
             $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
         } catch {
-            Stop-Prereq "Could not start the Hyper-V Virtual Machine Management service: $($_.Exception.Message)" @(
+            $startError = $_.Exception.Message
+            Assert-HyperVFeature
+            Stop-Prereq "Could not start the Hyper-V Virtual Machine Management service: $startError" @(
                 'Try starting it yourself:  Start-Service vmms',
                 'Inspect it with:  Get-Service vmms | Format-List *',
                 'If you just enabled Hyper-V, restart the PC and try again.'
@@ -306,18 +318,21 @@ function Assert-HyperV {
         }
     }
 
-    # 4. PowerShell module
+    # 3. PowerShell module
     if (-not (Get-Command New-VM -ErrorAction SilentlyContinue)) {
+        Assert-HyperVFeature
         Stop-Prereq 'The Hyper-V PowerShell module is not installed.' @(
             'Run in this elevated PowerShell:  Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-Management-PowerShell',
             'Open a new elevated PowerShell window and re-run this command.'
         )
     }
 
-    # 5. Can we actually talk to Hyper-V?
+    # 4. Can we actually talk to Hyper-V?
     try { $null = Get-VM -ErrorAction Stop }
     catch {
-        Stop-Prereq "Cannot talk to Hyper-V: $($_.Exception.Message)" @(
+        $vmError = $_.Exception.Message
+        Assert-HyperVFeature
+        Stop-Prereq "Cannot talk to Hyper-V: $vmError" @(
             'Make sure this is an elevated (Administrator) PowerShell window.',
             'If you just enabled Hyper-V, restart the PC.',
             'Check the service:  Get-Service vmms'
