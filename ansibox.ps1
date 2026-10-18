@@ -31,6 +31,7 @@
     .\ansibox.ps1 start                          # 3 nodes: control + 2 workers
     .\ansibox.ps1 start --nodes 4 --memory 2g
     .\ansibox.ps1 start --subnet 10.77.5.0/24    # use another /24
+    .\ansibox.ps1 start --memory-mode dynamic    # skip the memory question
     .\ansibox.ps1 status
     .\ansibox.ps1 ssh -n node1
     .\ansibox.ps1 stop
@@ -82,7 +83,7 @@ function Assert-Range([string]$Flag, [int]$Value, [int]$Min, [int]$Max, [string]
     }
 }
 
-$ValueFlags  = 'nodes', 'node', 'memory', 'cpus', 'disk-size', 'subnet', 'dns', 'profile'
+$ValueFlags  = 'nodes', 'node', 'memory', 'memory-mode', 'cpus', 'disk-size', 'subnet', 'dns', 'profile'
 $SwitchFlags = 'force', 'purge', 'help'
 # Short flags. As in minikube, -n is --nodes for 'start' but --node for 'ssh'.
 $ShortFlags  = @{ p = 'profile'; f = 'force'; h = 'help'; n = 'nodes' }
@@ -132,6 +133,23 @@ Assert-Range 'cpus'      $Cpus     1   8
 Assert-Range 'memory'    $MemoryMB 512 16384 'MB'
 Assert-Range 'disk-size' $DiskGB   4   200   'GB'
 $Workers = $Nodes - 1
+
+# Memory mode for the VMs this run creates. The script default is stored first in
+# $DefaultMemoryMode; --memory-mode (or the question asked when VMs are created) overrides it
+# for this run only. Nothing is saved, so the next run starts from the default again.
+$DefaultMemoryMode = 'static'
+$MemoryMode        = $DefaultMemoryMode
+$memoryModeFlag    = Get-Flag 'memory-mode' $null
+if ($null -ne $memoryModeFlag) {
+    $memoryModeFlag = ([string]$memoryModeFlag).ToLower()
+    if (@('static', 'dynamic') -notcontains $memoryModeFlag) {
+        throw "--memory-mode must be 'static' or 'dynamic' (got '$memoryModeFlag')."
+    }
+    $MemoryMode = $memoryModeFlag
+}
+# Dynamic mode: starts at --memory, may shrink to 512 MB and grow to twice --memory (max 16 GB).
+$DynMinMB = 512
+$DynMaxMB = [math]::Min(16384, $MemoryMB * 2)
 
 # --profile = the lab's name; it prefixes every VM (lab-control, lab-node1, ...)
 $Prefix = [string](Get-Flag 'profile' 'lab')
@@ -185,6 +203,7 @@ Ansible lab on Hyper-V
 
   .\ansibox.ps1 start   [--nodes 3] [--memory 1024] [--cpus 2] [--disk-size 10g]
                      [--subnet 172.16.10.0/24] [--dns 1.1.1.1,8.8.8.8]
+                     [--memory-mode static|dynamic]
   .\ansibox.ps1 status
   .\ansibox.ps1 ssh     [-n control|node1|node2|...]
   .\ansibox.ps1 stop
@@ -193,6 +212,9 @@ Ansible lab on Hyper-V
 Global flag:  -p, --profile <name>   lab name / VM prefix (default: lab)
 Sizes:        2048 = 2048mb = 2g (a bare number is MB, as in minikube)
 --nodes:      total node count, control included (3 = control + 2 workers)
+--memory-mode: static (default) = fixed RAM per VM; dynamic = Hyper-V resizes it between
+              512 MB and twice --memory. Without the flag you are asked when VMs are created.
+              The choice applies to that run only and is not saved.
 start:        creates the lab if it doesn't exist, otherwise just starts it again
               (pass --nodes to force a re-run that adds missing nodes)
 Env:          LAB_HOME  where the lab data lives (like MINIKUBE_HOME)
@@ -651,6 +673,13 @@ function New-LabVm([string]$Name, [bool]$IsControl) {
     New-VM -Name $Name -Generation 2 -MemoryStartupBytes ($MemoryMB * 1MB) `
            -VHDPath $disk -SwitchName $SwitchName -Path $VmDir | Out-Null
     Set-VM -Name $Name -ProcessorCount $Cpus -AutomaticStopAction ShutDown
+    # Memory mode (static or dynamic) was chosen once for this run - see Read-MemoryMode.
+    if ($MemoryMode -eq 'dynamic') {
+        Set-VMMemory -VMName $Name -DynamicMemoryEnabled $true `
+                     -MinimumBytes ($DynMinMB * 1MB) -StartupBytes ($MemoryMB * 1MB) -MaximumBytes ($DynMaxMB * 1MB)
+    } else {
+        Set-VMMemory -VMName $Name -DynamicMemoryEnabled $false
+    }
     Set-VMNetworkAdapter -VMName $Name -StaticMacAddress $mac
     Set-VMFirmware -VMName $Name -EnableSecureBoot Off
     Add-VMDvdDrive -VMName $Name -Path $iso
@@ -738,9 +767,47 @@ function Set-ControlNode([string]$ControlIp, [hashtable]$WorkerIps, [string]$Con
 
 function Get-LabVms { @(Get-VM -Name "$Prefix-*" -ErrorAction SilentlyContinue) }
 
+# Static vs dynamic memory for the VMs this run is about to create.
+#   - --memory-mode on the command line wins: nothing is asked.
+#   - Otherwise the user is asked; just pressing Enter keeps the script default.
+#   - With nobody to ask (input redirected, CI) the default is used.
+# The answer lives in $MemoryMode for this run only. It is never saved.
+function Read-MemoryMode {
+    if ($Flags.ContainsKey('memory-mode')) { return $MemoryMode }
+    if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) { return $DefaultMemoryMode }
+
+    $sTag = if ($DefaultMemoryMode -eq 'static')  { '  (default)' } else { '' }
+    $dTag = if ($DefaultMemoryMode -eq 'dynamic') { '  (default)' } else { '' }
+    Write-Host ''
+    Write-Host 'Memory mode for the new VMs:'
+    Write-Host "  [S] Static   fixed $MemoryMB MB per VM$sTag"
+    Write-Host "  [D] Dynamic  starts at $MemoryMB MB, Hyper-V resizes it between $DynMinMB and $DynMaxMB MB$dTag"
+    while ($true) {
+        $ans = ([string](Read-Host "Choose S or D (Enter = $DefaultMemoryMode)")).Trim().ToLower()
+        if ($ans -eq '')                         { return $DefaultMemoryMode }
+        if ($ans -eq 's' -or $ans -eq 'static')  { return 'static' }
+        if ($ans -eq 'd' -or $ans -eq 'dynamic') { return 'dynamic' }
+        Write-Warn2 "Please answer S or D (or press Enter for $DefaultMemoryMode)."
+    }
+}
+
 # ------------------------------------------------------------------ actions
 function Invoke-Up {
     Test-Prerequisites
+
+    # Ask about memory first, so the long steps below (image download, first boot) run unattended.
+    # Only asked when this run will actually create VMs; existing VMs keep their settings.
+    $labNames = @("$Prefix-control") + @(1..$Workers | ForEach-Object { "$Prefix-node$_" })
+    $newVms   = @($labNames | Where-Object { -not (Get-VM -Name $_ -ErrorAction SilentlyContinue) })
+    if ($newVms.Count -gt 0) {
+        $script:MemoryMode = Read-MemoryMode
+        if ($MemoryMode -eq 'dynamic') {
+            Write-Ok "Memory: dynamic ($DynMinMB MB minimum, $MemoryMB MB at start, $DynMaxMB MB maximum)"
+        } else {
+            Write-Ok "Memory: static ($MemoryMB MB per VM)"
+        }
+    }
+
     Initialize-SshKey
     Initialize-BaseDisk
     Initialize-LabNetwork

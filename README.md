@@ -74,6 +74,7 @@ The first `start` takes a while (download, conversion, first boot, package insta
 .\ansibox.ps1 start --nodes 4 --memory 2g
 .\ansibox.ps1 start --cpus 4 --disk-size 20g
 .\ansibox.ps1 start --subnet 10.77.5.0/24
+.\ansibox.ps1 start --memory-mode dynamic
 ```
 
 `start` behaves like minikube's:
@@ -81,6 +82,8 @@ The first `start` takes a while (download, conversion, first boot, package insta
 - **No lab yet** -> builds everything.
 - **Lab exists, no `--nodes` flag** -> just powers the VMs on (and recreates the switch/NAT if the host lost them, e.g. after a reboot). Files in `~/lab` on the control node are left alone.
 - **Lab exists, `--nodes` passed** -> re-runs the full build: existing VMs are kept, missing nodes are added, and the control node's `~/lab/inventory.ini`, `ansible.cfg` and `site.yml` are **regenerated (overwritten)**.
+
+When `start` is about to create VMs, it first asks whether they should use **static** memory (fixed RAM, the default) or **dynamic** memory. Press Enter for static, or pass `--memory-mode static|dynamic` to skip the question. The question is also skipped when there is no console to answer it (for example in CI), and static is used. The choice applies to that run only and is not saved. It is not asked when `start` just powers on an existing lab.
 
 ### `ssh`
 
@@ -100,19 +103,20 @@ The first `start` takes a while (download, conversion, first boot, package insta
 
 ## Flags
 
-| Flag              | Default           | Range          | Description                                                       |
-| ----------------- | ----------------- | -------------- | ----------------------------------------------------------------- |
-| `--nodes`         | `3`               | 2-11           | Total node count, **control included** (3 = control + 2 workers). |
-| `--cpus`          | `2`               | 1-8            | vCPUs per VM.                                                     |
-| `--memory`        | `1024`            | 512-16384 MB   | RAM per VM.                                                       |
-| `--disk-size`     | `10g`             | 4-200 GB       | Virtual disk size per VM.                                         |
-| `--subnet`        | `172.16.10.0/24`  | any /24        | Lab network.                                                      |
-| `--dns`           | `1.1.1.1,8.8.8.8` | -              | DNS servers handed to the VMs (comma or space separated).         |
-| `-p`, `--profile` | `lab`             | letters/digits | Lab name; prefixes every VM and the switch/NAT.                   |
-| `-n`              | -                 | -              | `--nodes` for `start`, `--node` for `ssh` (as in minikube).       |
-| `-f`, `--force`   | off               | -              | Skip the confirmation prompt on `delete`.                         |
-| `--purge`         | off               | -              | With `delete`, also remove the lab folder.                        |
-| `-h`, `--help`    | -                 | -              | Show usage.                                                       |
+| Flag              | Default           | Range               | Description                                                                  |
+| ----------------- | ----------------- | ------------------- | ---------------------------------------------------------------------------- |
+| `--nodes`         | `3`               | 2-11                | Total node count, **control included** (3 = control + 2 workers).            |
+| `--cpus`          | `2`               | 1-8                 | vCPUs per VM.                                                                |
+| `--memory`        | `1024`            | 512-16384 MB        | RAM per VM.                                                                  |
+| `--memory-mode`   | `static` (asked)  | `static`, `dynamic` | Fixed RAM per VM, or let Hyper-V resize it. See [Memory mode](#memory-mode). |
+| `--disk-size`     | `10g`             | 4-200 GB            | Virtual disk size per VM.                                                    |
+| `--subnet`        | `172.16.10.0/24`  | any /24             | Lab network.                                                                 |
+| `--dns`           | `1.1.1.1,8.8.8.8` | -                   | DNS servers handed to the VMs (comma or space separated).                    |
+| `-p`, `--profile` | `lab`             | letters/digits      | Lab name; prefixes every VM and the switch/NAT.                              |
+| `-n`              | -                 | -                   | `--nodes` for `start`, `--node` for `ssh` (as in minikube).                  |
+| `-f`, `--force`   | off               | -                   | Skip the confirmation prompt on `delete`.                                    |
+| `--purge`         | off               | -                   | With `delete`, also remove the lab folder.                                   |
+| `-h`, `--help`    | -                 | -                   | Show usage.                                                                  |
 
 Flags accept `--flag value`, `--flag=value`, and the short forms above.
 
@@ -122,9 +126,18 @@ Sizes follow minikube: `<number>[b|k|m|g]` with an optional trailing `b`. A bare
 
 > PowerShell converts an unquoted `2gb` or `512mb` into a byte count before the script sees it. AnsiBox detects such large bare numbers and treats them as bytes, so all of these work.
 
+### Memory mode
+
+- **static** (default): every VM gets exactly `--memory` MB.
+- **dynamic**: each VM starts at `--memory` MB, and Hyper-V may shrink it to 512 MB or grow it up to twice `--memory` (at most 16384 MB).
+
+Without `--memory-mode`, `start` asks when it is about to create VMs; pressing Enter keeps static. Hyper-V has no host-wide dynamic-memory setting, so nothing is saved: each run starts from the default again.
+
+Dynamic memory only grows if the guest supports Hyper-V memory ballooning. Inside a VM, `lsmod | grep hv_balloon` shows whether the driver is loaded. If a VM never gets more memory, use static. You can check what a VM uses with `Get-VMMemory -VMName lab-control`.
+
 ### Notes on what applies when
 
-- `--cpus` and `--memory` apply to VMs **as they are created**. Existing VMs keep their settings.
+- `--cpus`, `--memory` and `--memory-mode` apply to VMs **as they are created**. Existing VMs keep their settings.
 - `--disk-size` is applied **once**, when the shared base disk is built. To change it later, use `delete --purge` and start again.
 
 ## Networking
@@ -151,6 +164,7 @@ Each VM gets a static MAC (`00:15:5D:10:0A:xx`) so cloud-init can match the righ
 **Every VM**
 
 - Generation 2 Hyper-V VM, Secure Boot off, differencing disk on the shared base image
+- Static memory by default, or dynamic memory if you chose it (see [Memory mode](#memory-mode))
 - User `ansible` with passwordless `sudo` and key-only SSH (password login locked)
 - `hyperv-daemons` installed and `hv-kvp-daemon` enabled
 - Configured on first boot through a cloud-init NoCloud seed ISO (built with the IMAPI2 COM API that ships with Windows, so no extra ISO tools are needed)
@@ -187,6 +201,8 @@ ssh -i "$env:USERPROFILE\ansible-lab\lab_key" ansible@172.16.10.2
 ## Built-in prerequisite checks
 
 Before any command except `help`, AnsiBox verifies that the machine is ready and stops with a short, readable message if it isn't. You never get a raw PowerShell stack trace.
+
+On a healthy machine these checks take about a second or two. The slower Windows feature query (is Hyper-V installed, is a restart pending, is this Windows Home) only runs when one of the quick checks fails, to explain why.
 
 | Check                                                              | If it fails                                                                                                   |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
