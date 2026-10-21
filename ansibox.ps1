@@ -657,33 +657,53 @@ function New-LabVm([string]$Name, [bool]$IsControl) {
     }
     Write-Step "Creating $Name ($(Get-LabIp $Name))"
     $dir = "$VmDir\$Name"
+    # No VM with this name exists (checked above), so a folder here is a leftover of an
+    # earlier failed run. Start clean, otherwise New-VHD fails with "file already exists".
+    if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
     New-Item -ItemType Directory -Force $dir | Out-Null
 
-    $ip   = Get-LabIp  $Name
-    $mac  = Get-LabMac $Name
-    $pub  = (Get-Content "$KeyPath.pub" -Raw).Trim()
-    $ud   = New-UserData -HostName $Name -IsControl $IsControl -PubKey $pub
-    $md   = "instance-id: $Name-$([guid]::NewGuid().ToString('N').Substring(0,8))`nlocal-hostname: $Name`n"
-    $nc   = New-NetworkConfig -Ip $ip -Mac $mac
-    $iso  = New-SeedIso -Dir $dir -UserData $ud -MetaData $md -NetworkConfig $nc
+    try {
+        $ip   = Get-LabIp  $Name
+        $mac  = Get-LabMac $Name
+        $pub  = (Get-Content "$KeyPath.pub" -Raw).Trim()
+        $ud   = New-UserData -HostName $Name -IsControl $IsControl -PubKey $pub
+        $md   = "instance-id: $Name-$([guid]::NewGuid().ToString('N').Substring(0,8))`nlocal-hostname: $Name`n"
+        $nc   = New-NetworkConfig -Ip $ip -Mac $mac
+        $iso  = New-SeedIso -Dir $dir -UserData $ud -MetaData $md -NetworkConfig $nc
 
-    $disk = "$dir\disk.vhdx"
-    New-VHD -Path $disk -ParentPath $BaseVhdx -Differencing | Out-Null
+        $disk = "$dir\disk.vhdx"
+        New-VHD -Path $disk -ParentPath $BaseVhdx -Differencing | Out-Null
 
-    New-VM -Name $Name -Generation 2 -MemoryStartupBytes ($MemoryMB * 1MB) `
-           -VHDPath $disk -SwitchName $SwitchName -Path $VmDir | Out-Null
-    Set-VM -Name $Name -ProcessorCount $Cpus -AutomaticStopAction ShutDown
-    # Memory mode (static or dynamic) was chosen once for this run - see Read-MemoryMode.
-    if ($MemoryMode -eq 'dynamic') {
-        Set-VMMemory -VMName $Name -DynamicMemoryEnabled $true `
-                     -MinimumBytes ($DynMinMB * 1MB) -StartupBytes ($MemoryMB * 1MB) -MaximumBytes ($DynMaxMB * 1MB)
-    } else {
-        Set-VMMemory -VMName $Name -DynamicMemoryEnabled $false
+        New-VM -Name $Name -Generation 2 -MemoryStartupBytes ($MemoryMB * 1MB) `
+               -VHDPath $disk -SwitchName $SwitchName -Path $VmDir | Out-Null
+        Set-VM -Name $Name -ProcessorCount $Cpus -AutomaticStopAction ShutDown
+        # Memory mode (static or dynamic) was chosen once for this run - see Read-MemoryMode.
+        if ($MemoryMode -eq 'dynamic') {
+            Set-VMMemory -VMName $Name -DynamicMemoryEnabled $true `
+                         -MinimumBytes ($DynMinMB * 1MB) -StartupBytes ($MemoryMB * 1MB) -MaximumBytes ($DynMaxMB * 1MB)
+        } else {
+            Set-VMMemory -VMName $Name -DynamicMemoryEnabled $false
+        }
+        Set-VMNetworkAdapter -VMName $Name -StaticMacAddress $mac
+        Set-VMFirmware -VMName $Name -EnableSecureBoot Off
+        Add-VMDvdDrive -VMName $Name -Path $iso
+        Set-VMFirmware -VMName $Name -FirstBootDevice (Get-VMHardDiskDrive -VMName $Name)
     }
-    Set-VMNetworkAdapter -VMName $Name -StaticMacAddress $mac
-    Set-VMFirmware -VMName $Name -EnableSecureBoot Off
-    Add-VMDvdDrive -VMName $Name -Path $iso
-    Set-VMFirmware -VMName $Name -FirstBootDevice (Get-VMHardDiskDrive -VMName $Name)
+    catch {
+        # Roll back: a half-built VM (e.g. without its seed ISO) would be "kept" on the next
+        # run and never get its IP. Remove the VM and its folder, then report the real error.
+        $err = $_
+        Write-Warn2 "Creating $Name failed - rolling back"
+        try {
+            $vm = Get-VM -Name $Name -ErrorAction SilentlyContinue
+            if ($vm) {
+                if ($vm.State -ne 'Off') { Stop-VM -Name $Name -TurnOff -Force -ErrorAction SilentlyContinue }
+                Remove-VM -Name $Name -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
+        Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+        throw $err
+    }
 }
 
 # The same IP can come back with a new host key after destroy/up of a single VM.
@@ -716,9 +736,41 @@ function Copy-ToRemote([string]$Ip, [string]$Local, [string]$Remote) {
     if ($LASTEXITCODE -ne 0) { throw "scp of $Local failed." }
 }
 
+# SSH answers as soon as cloud-init has created the user and key, which is BEFORE its package
+# stage (hyperv-daemons, ansible) finishes. Until then apt holds the dpkg lock, so a playbook
+# run right after 'start' could fail. Block until cloud-init is done, with an upper limit.
+function Wait-CloudInit([string]$Name, [string]$Ip, [int]$TimeoutSec = 900) {
+    $rc = Invoke-Remote $Ip "timeout $TimeoutSec cloud-init status --wait >/dev/null 2>&1"
+    # 0 = done, 2 = done with recoverable warnings (not worth alarming anyone about)
+    if ($rc -eq 0 -or $rc -eq 2) { return }
+    if ($rc -eq 124) {
+        Write-Warn2 "${Name}: cloud-init still running after $TimeoutSec s. Check with: sudo cloud-init status --long"
+    } else {
+        Write-Warn2 "${Name}: cloud-init reported errors (exit $rc). Check with: sudo cloud-init status --long"
+    }
+}
+
+# Push a generated file to ~/lab on the control node WITHOUT clobbering the user's edits:
+#   - missing        -> copy it
+#   - identical      -> nothing to do
+#   - exists, differs -> keep the user's file, save ours next to it as <name>.new and say so
+function Send-LabFile([string]$Ip, [string]$LocalPath, [string]$RemoteName) {
+    $ErrorActionPreference = 'Continue'
+    $remote = "lab/$RemoteName"
+    if ((Invoke-Remote $Ip "test -e $remote") -ne 0) {
+        Copy-ToRemote $Ip $LocalPath $remote
+        return
+    }
+    $localHash  = (Get-FileHash $LocalPath -Algorithm SHA256).Hash.ToLower()
+    $remoteOut  = & ssh @BatchOpts "$LabUser@$Ip" "sha256sum $remote" 2>$null
+    $remoteHash = if ($LASTEXITCODE -eq 0 -and $remoteOut) { (([string]($remoteOut | Select-Object -First 1)) -split '\s+')[0].ToLower() } else { '' }
+    if ($remoteHash -eq $localHash) { return }
+    Copy-ToRemote $Ip $LocalPath "$remote.new"
+    Write-Warn2 "~/lab/$RemoteName already exists and differs - kept yours, new version saved as ~/lab/$RemoteName.new"
+}
+
 function Set-ControlNode([string]$ControlIp, [hashtable]$WorkerIps, [string]$ControlName) {
-    Write-Step 'Configuring the control node (waiting for cloud-init to install Ansible)'
-    [void](Invoke-Remote $ControlIp 'cloud-init status --wait >/dev/null 2>&1')
+    Write-Step 'Configuring the control node'
     if ((Invoke-Remote $ControlIp 'command -v ansible >/dev/null') -ne 0) {
         Write-Warn2 'Ansible is not installed on control yet (apt may have failed). Check: sudo cloud-init status --long'
     }
@@ -758,14 +810,28 @@ function Set-ControlNode([string]$ControlIp, [hashtable]$WorkerIps, [string]$Con
 
     [void](Invoke-Remote $ControlIp 'mkdir -p ~/lab ~/.ssh')
     Copy-ToRemote $ControlIp $KeyPath           '.ssh/id_ed25519'
-    Copy-ToRemote $ControlIp "$tmp\inventory.ini" 'lab/inventory.ini'
-    Copy-ToRemote $ControlIp "$tmp\ansible.cfg"   'lab/ansible.cfg'
-    Copy-ToRemote $ControlIp "$tmp\site.yml"      'lab/site.yml'
+    # The private key is always (re)pushed - it never changes. The lab files are not overwritten.
+    Send-LabFile $ControlIp "$tmp\inventory.ini" 'inventory.ini'
+    Send-LabFile $ControlIp "$tmp\ansible.cfg"   'ansible.cfg'
+    Send-LabFile $ControlIp "$tmp\site.yml"      'site.yml'
     [void](Invoke-Remote $ControlIp 'chmod 600 ~/.ssh/id_ed25519')
     Remove-Item $tmp -Recurse -Force
 }
 
-function Get-LabVms { @(Get-VM -Name "$Prefix-*" -ErrorAction SilentlyContinue) }
+# A VM belongs to the lab only if it is named exactly <prefix>-control or <prefix>-nodeN.
+# A bare "<prefix>-*" wildcard would also catch unrelated VMs (e.g. "lab-sql") and
+# 'delete' would remove them.
+function Test-LabVmName([string]$Name) {
+    return ($Name -match ('^' + [regex]::Escape($Prefix) + '-(control|node\d+)$'))
+}
+function Get-LabVms {
+    @(Get-VM -Name "$Prefix-*" -ErrorAction SilentlyContinue | Where-Object { Test-LabVmName $_.Name })
+}
+# VM folders under $VmDir that follow the lab naming (also finds leftovers of a failed build).
+function Get-LabVmDirs {
+    if (-not (Test-Path $VmDir)) { return @() }
+    @(Get-ChildItem $VmDir -Directory -ErrorAction SilentlyContinue | Where-Object { Test-LabVmName $_.Name })
+}
 
 # Static vs dynamic memory for the VMs this run is about to create.
 #   - --memory-mode on the command line wins: nothing is asked.
@@ -832,6 +898,12 @@ function Invoke-Up {
         Write-Ok "$n  $($ips[$n])"
     }
 
+    Write-Step 'Waiting for cloud-init to finish on every node (installs packages, up to a few minutes)'
+    foreach ($n in @($control) + $workers) {
+        Wait-CloudInit $n $ips[$n]
+        Write-Ok "$n  cloud-init done"
+    }
+
     $workerIps = @{}
     foreach ($w in $workers) { $workerIps[$w] = $ips[$w] }
     Set-ControlNode -ControlIp $ips[$control] -WorkerIps $workerIps -ControlName $control
@@ -876,13 +948,15 @@ function Invoke-SshAction {
 }
 
 function Invoke-Destroy {
-    $vms = Get-LabVms
+    $vms  = Get-LabVms
+    $dirs = Get-LabVmDirs
     $haveNet = [bool](Get-VMSwitch -Name $SwitchName -ErrorAction SilentlyContinue) -or
                [bool](Get-NetNat -Name $NatName -ErrorAction SilentlyContinue)
-    if (-not $vms -and -not $haveNet -and -not $Purge) { Write-Host 'Nothing to destroy.'; return }
+    if (-not $vms -and -not $dirs -and -not $haveNet -and -not $Purge) { Write-Host 'Nothing to destroy.'; return }
 
     if (-not $Force) {
-        $what = if ($Purge) { "ALL lab VMs, the lab switch/NAT and everything in $LabPath (keys + cached image)" } else { 'all lab VMs, their disks and the lab switch/NAT' }
+        $list = if ($vms) { ' [' + ((@($vms) | ForEach-Object { $_.Name }) -join ', ') + ']' } else { '' }
+        $what = if ($Purge) { "ALL lab VMs$list, the lab switch/NAT and everything in $LabPath (keys + cached image)" } else { "all lab VMs$list, their disks and the lab switch/NAT" }
         $ans = Read-Host "This will delete $what. Continue? [y/N]"
         if ($ans -notmatch '^(y|yes)$') { Write-Host 'Aborted.'; return }
     }
@@ -893,6 +967,8 @@ function Invoke-Destroy {
         Remove-VM -Name $vm.Name -Force
         Remove-Item "$VmDir\$($vm.Name)" -Recurse -Force -ErrorAction SilentlyContinue
     }
+    # Folders with no VM behind them (left by a failed 'start') are removed too.
+    foreach ($d in (Get-LabVmDirs)) { Remove-Item $d.FullName -Recurse -Force -ErrorAction SilentlyContinue }
     Remove-LabNetwork
     Remove-Item $KnownHost -Force -ErrorAction SilentlyContinue
 
