@@ -1,10 +1,11 @@
 #Requires -Version 5.1
-# NOTE: there is deliberately no "#Requires -RunAsAdministrator" here. PowerShell would
-# reject the script with a raw, hard-to-read error before any of our code runs.
-# Assert-Administrator / Assert-HyperV below do the same job with actionable messages.
+# NOTE: there is deliberately no "#Requires -RunAsAdministrator" here. It would demand
+# elevation for EVERY command (even 'ssh') and reject the script with a raw, hard-to-read
+# error. Instead each command asks only for the rights it really needs - see the main
+# section at the bottom, Assert-Administrator and Assert-HyperVAccess.
 <#
 .SYNOPSIS
-    One-command Ansible home lab on Hyper-V (a "minikube" for Ansible).
+    One-command Ansible home lab on Hyper-V.
 
 .DESCRIPTION
     Builds a control node (Ansible preinstalled) plus worker nodes from an official
@@ -20,9 +21,9 @@
     Every VM is a differencing disk on one shared base image per OS, so extra nodes cost
     almost no disk space.
 
-    The command line copies minikube: same verbs (start, stop, status, ssh,
-    delete) and the same flags where they make sense. Both "--nodes 3" and
-    "--nodes=3" work.
+    Simple verbs (start, stop, status, ssh, delete) and GNU-style flags.
+    Both "--nodes 3" and "--nodes=3" work. Run "help" for the full manual and
+    "help <command>" for the details of one command.
 
     Prerequisites are checked up front, with clear "how to fix" steps instead of
     stack traces: Administrator rights, Hyper-V enabled, the hypervisor running,
@@ -50,10 +51,10 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-# Print errors the way minikube does ("X message") instead of a PowerShell stack trace.
+# Print errors as one short line ("X message") instead of a PowerShell stack trace.
 trap { Write-Host "X $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
 
-# ------------------------------------------------- minikube-style command line
+# ------------------------------------------------------------ command line
 # PowerShell's param() can't bind GNU-style "--flag value", so $args is parsed by hand.
 # Accepted forms:  --nodes 3   --nodes=3   -n 3     (switches: --purge, --force / -f)
 function Get-Flag([string]$Name, $Default) {
@@ -67,7 +68,7 @@ function ConvertTo-Int([string]$Text, [string]$Flag) {
     return $n
 }
 
-# minikube size format: <number>[b|k|m|g], optional trailing "b". A bare number is MB.
+# Size format: <number>[b|k|m|g], optional trailing "b". A bare number is MB.
 #   2048 = 2048mb = 2g = 2gb
 # Gotcha: PowerShell itself turns an unquoted "2gb" / "512mb" into a plain byte count
 # (2147483648 / 536870912) before the script sees it. No valid size in MB has 7+ digits,
@@ -97,7 +98,8 @@ function Assert-Range([string]$Flag, [int]$Value, [int]$Min, [int]$Max, [string]
 # One entry per OS family. Everything that differs between Debian and Red Hat style
 # systems lives here, so the rest of the script stays distro-neutral:
 #   image + checksum location, admin group, cloud-init packages, the Hyper-V guest
-#   service, the default-route spelling and the package task of the smoke-test playbook.
+#   service, extra control-node setup, the default-route spelling and the package task
+#   of the smoke-test playbook.
 #
 # 'rhel' = AlmaLinux 9: a free, 1:1 rebuild of RHEL (no subscription, no license), shipped
 # as an official minimal cloud image with cloud-init. ansible-core comes straight from the
@@ -125,6 +127,8 @@ $Distros = [ordered]@{
         Packages        = @('hyperv-daemons')
         ControlPackages = @('ansible')
         RunCmd          = @('systemctl enable --now hv-kvp-daemon.service || true')
+        # The Debian 'ansible' package already bundles ansible.posix, community.general, ...
+        ControlRunCmd   = @()
         SmokeTask       = @(
             '    - name: Install htop',
             '      ansible.builtin.apt:',
@@ -159,6 +163,15 @@ $Distros = [ordered]@{
             'dnf -y install hyperv-daemons || true',
             'systemctl enable --now hypervkvpd.service || true'
         )
+        # ansible-core ships only ansible.builtin. Debian's full 'ansible' package also bundles
+        # ansible.posix (firewalld, selinux, seboolean, authorized_key, sysctl, mount) and
+        # community.general, so install them here to make both labs behave the same.
+        # System-wide path (on ansible-core's default collections path) = works for every user.
+        # '|| true': a missing internet connection must not fail cloud-init; the collections
+        # can be installed later by hand with: ansible-galaxy collection install ansible.posix
+        ControlRunCmd   = @(
+            'ansible-galaxy collection install -p /usr/share/ansible/collections ansible.posix community.general || true'
+        )
         SmokeTask       = @(
             '    - name: Install tmux',
             '      ansible.builtin.dnf:',
@@ -180,7 +193,7 @@ function ConvertTo-DistroKey([string]$Text) {
 
 $ValueFlags  = 'nodes', 'node', 'memory', 'memory-mode', 'cpus', 'disk-size', 'subnet', 'dns', 'profile', 'distro'
 $SwitchFlags = 'force', 'purge', 'help'
-# Short flags. As in minikube, -n is --nodes for 'start' but --node for 'ssh'.
+# Short flags. -n is --nodes for 'start' but --node for 'ssh'.
 $ShortFlags  = @{ p = 'profile'; f = 'force'; h = 'help'; n = 'nodes' }
 
 $tokens  = @($args | ForEach-Object { "$_" })
@@ -219,7 +232,7 @@ for ($i = 0; $i -lt $tokens.Count; $i++) {
 }
 
 # ---- flags -> the variables the rest of the script uses
-$Nodes    = ConvertTo-Int (Get-Flag 'nodes' 3) 'nodes'          # total, control included (like minikube)
+$Nodes    = ConvertTo-Int (Get-Flag 'nodes' 3) 'nodes'          # total, control included
 $Cpus     = ConvertTo-Int (Get-Flag 'cpus' 2) 'cpus'
 $MemoryMB = ConvertTo-MB  (Get-Flag 'memory' 1024) 'memory'
 $DiskGB   = [int][math]::Ceiling((ConvertTo-MB (Get-Flag 'disk-size' '10g') 'disk-size') / 1024)
@@ -262,7 +275,7 @@ else { throw "--subnet must be a /24 such as 10.77.5.0/24 (got '$subnetText')." 
 # DNS servers handed to the VMs (the internal switch has no DHCP/DNS of its own)
 [string[]]$Dns = @((Get-Flag 'dns' '1.1.1.1,8.8.8.8') -split '[,\s]+' | Where-Object { $_ })
 
-# Like MINIKUBE_HOME: set LAB_HOME to keep the lab somewhere else
+# Set the LAB_HOME environment variable to keep the lab data somewhere else
 $LabPath = if ($env:LAB_HOME) { $env:LAB_HOME } else { Join-Path $env:USERPROFILE 'ansible-lab' }
 
 $Force  = $Flags.ContainsKey('force')
@@ -299,38 +312,275 @@ function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "    $msg" -ForegroundColor Green }
 function Write-Warn2($msg){ Write-Host "    $msg" -ForegroundColor Yellow }
 
+# ---- run timer: shown only by 'start' and 'delete' (the long-running commands)
+# Started in the main section. Time spent waiting for the user to answer a question is
+# NOT counted (Read-Answer pauses the timer), so the number reflects the work itself.
+$CommandTimer = New-Object Diagnostics.Stopwatch
+
+function Read-Answer([string]$Prompt) {
+    $wasRunning = $CommandTimer.IsRunning
+    $CommandTimer.Stop()
+    try { return (Read-Host $Prompt) }
+    finally { if ($wasRunning) { $CommandTimer.Start() } }
+}
+
+function Format-Elapsed([TimeSpan]$Span) {
+    if ($Span.TotalHours   -ge 1) { return ('{0}h {1:00}m {2:00}s' -f [int][math]::Floor($Span.TotalHours), $Span.Minutes, $Span.Seconds) }
+    if ($Span.TotalMinutes -ge 1) { return ('{0}m {1:00}s' -f $Span.Minutes, $Span.Seconds) }
+    return ('{0:0.0}s' -f $Span.TotalSeconds)
+}
+
+function Write-Elapsed {
+    Write-Host ''
+    Write-Host ("Total time: {0}" -f (Format-Elapsed $CommandTimer.Elapsed)) -ForegroundColor Cyan
+}
+
+# ------------------------------------------------------------------ help manual
+#   .\ansibox.ps1 help             overview of everything
+#   .\ansibox.ps1 help <command>   one command in detail   (also:  <command> --help)
+function Write-HelpTitle([string]$Text) {
+    Write-Host ''
+    Write-Host $Text -ForegroundColor Yellow
+}
+
+# "  left-column   right text". Pass '' as $Left for a continuation line.
+function Write-HelpRow([string]$Left, [string]$Right, [int]$Width = 24) {
+    Write-Host '  ' -NoNewline
+    Write-Host (($Left + '  ').PadRight($Width)) -NoNewline -ForegroundColor Cyan
+    Write-Host $Right
+}
+
+function Write-HelpText([string[]]$Lines) {
+    foreach ($line in $Lines) { Write-Host "  $line" }
+}
+
+function Write-HelpExample([string]$Cmd, [string]$Note = '') {
+    Write-Host '  ' -NoNewline
+    if ($Note) {
+        Write-Host (('.\ansibox.ps1 ' + $Cmd + '  ').PadRight(52)) -NoNewline -ForegroundColor Green
+        Write-Host "# $Note" -ForegroundColor DarkGray
+    } else {
+        Write-Host ('.\ansibox.ps1 ' + $Cmd) -ForegroundColor Green
+    }
+}
+
+# Who needs what, shared by the overview and the per-command pages.
+function Write-HelpRights {
+    Write-HelpTitle 'ADMINISTRATOR RIGHTS  (asked only where they are really needed)'
+    Write-HelpRow 'help, ssh' 'none' 30
+    Write-HelpRow 'status, stop, start' "Administrator OR membership of the 'Hyper-V Administrators' group" 30
+    Write-HelpRow '' 'start also needs Administrator if the lab network has to be recreated' 30
+    Write-HelpRow 'start (new lab, --nodes)' 'Administrator: it creates the virtual switch, NAT and host IP address' 30
+    Write-HelpRow 'delete' 'Administrator: it removes the virtual switch and NAT network' 30
+    Write-HelpText @(
+        '',
+        'One-time setup so status / stop / start / ssh never need elevation',
+        '(run in an elevated PowerShell, then sign out and back in):',
+        '  Add-LocalGroupMember -Group (Get-LocalGroup -SID S-1-5-32-578) -Member $env:USERNAME'
+    )
+}
+
 function Show-Usage {
-@"
-Ansible lab on Hyper-V
+    Write-Host ''
+    Write-Host 'AnsiBox' -NoNewline -ForegroundColor Cyan
+    Write-Host '  -  an Ansible lab on Hyper-V, in one command'
 
-  .\ansibox.ps1 start   [--nodes 3] [--memory 1024] [--cpus 2] [--disk-size 10g]
-                     [--distro debian|rhel]
-                     [--subnet 172.16.10.0/24] [--dns 1.1.1.1,8.8.8.8]
-                     [--memory-mode static|dynamic]
-  .\ansibox.ps1 status
-  .\ansibox.ps1 ssh     [-n control|node1|node2|...]
-  .\ansibox.ps1 stop
-  .\ansibox.ps1 delete  [--purge] [--force]
+    Write-HelpTitle 'USAGE'
+    Write-HelpText @(
+        '.\ansibox.ps1 <command> [options]',
+        '.\ansibox.ps1 help <command>        details, options and examples for one command'
+    )
 
-Global flag:  -p, --profile <name>   lab name / VM prefix (default: lab)
-Sizes:        2048 = 2048mb = 2g (a bare number is MB, as in minikube)
---nodes:      total node count, control included (3 = control + 2 workers)
---distro:     debian = Debian 13 "Trixie"   (apt)
-              rhel   = AlmaLinux 9, Red Hat family, free RHEL clone (dnf)
-              Without the flag you are asked the first time the lab is created.
-              The choice is remembered until 'delete'; a lab uses a single OS.
---memory-mode: static (default) = fixed RAM per VM; dynamic = Hyper-V resizes it between
-              512 MB and twice --memory. Without the flag you are asked when VMs are created.
-              The choice applies to that run only and is not saved.
-start:        creates the lab if it doesn't exist, otherwise just starts it again
-              (pass --nodes to force a re-run that adds missing nodes)
-Env:          LAB_HOME  where the lab data lives (like MINIKUBE_HOME)
+    Write-HelpTitle 'COMMANDS'
+    Write-HelpRow 'start'  'Create the lab (a control node with Ansible + workers), or start it again if it exists'
+    Write-HelpRow 'status' 'List the lab VMs: state, OS, IP address, CPUs, memory'
+    Write-HelpRow 'ssh'    'Open an SSH session on a node (default: the control node)'
+    Write-HelpRow 'stop'   'Shut the lab VMs down. Disks and data are kept'
+    Write-HelpRow 'delete' 'Remove the lab VMs, their disks, the virtual switch and the NAT network'
+    Write-HelpRow 'help'   'This page'
 
-Fixed IPs:  $Subnet.1 host/gateway, $Subnet.2 control, $Subnet.3 node1, $Subnet.4 node2, ...
+    Write-HelpTitle 'OPTIONS  (the ones for start are listed in: help start)'
+    Write-HelpRow '-p, --profile <name>' 'Lab name and VM prefix (default: lab)'
+    Write-HelpRow '-h, --help' 'Help for a command, for example:  .\ansibox.ps1 start --help'
+    Write-HelpRow '--flag value' 'Both "--nodes 3" and "--nodes=3" work'
 
-Run from an elevated (Administrator) PowerShell.
-Lab data lives in: $LabPath
-"@ | Write-Host
+    Write-HelpTitle 'QUICK START'
+    Write-HelpText @(
+        '1. In an Administrator PowerShell, create the lab (the OS image downloads once):',
+        '       .\ansibox.ps1 start',
+        '2. Connect to the control node:',
+        '       .\ansibox.ps1 ssh',
+        '3. On the control node, check the nodes and run the sample playbook:',
+        '       cd ~/lab && ansible all -m ping',
+        '       ansible-playbook site.yml',
+        '4. Pause for the day, resume later, or throw the lab away:',
+        '       .\ansibox.ps1 stop        .\ansibox.ps1 start        .\ansibox.ps1 delete'
+    )
+
+    Write-HelpTitle 'EXAMPLES'
+    Write-HelpExample 'start'                                   'asks for the OS, then control + 2 workers'
+    Write-HelpExample 'start --distro rhel'                      'AlmaLinux 9 (Red Hat family), no question'
+    Write-HelpExample 'start --distro debian --nodes 4 --memory 2g' 'control + 3 workers, 2 GB each'
+    Write-HelpExample 'ssh node1'                                'same as: ssh -n node1'
+    Write-HelpExample 'status'
+    Write-HelpExample 'delete --purge'                          'also removes the key and the cached images'
+
+    Write-HelpTitle 'NETWORK  (fixed IP addresses, the same on every run)'
+    Write-HelpRow "$Subnet.1" 'your PC, the gateway of the lab network' 16
+    Write-HelpRow "$Subnet.2" "$Prefix-control  (Ansible is installed here, your files are in ~/lab)" 16
+    Write-HelpRow "$Subnet.3" "$Prefix-node1" 16
+    Write-HelpRow "$Subnet.4" "$Prefix-node2, and so on" 16
+
+    Write-HelpRights
+
+    Write-HelpTitle 'GOOD TO KNOW'
+    Write-HelpText @(
+        '- A lab uses one operating system (debian or rhel) until you delete it.',
+        '- Only one lab network can exist at a time: Windows allows a single NAT network.',
+        '- The OS image is downloaded once and cached, even after delete (delete --purge removes it).',
+        '- Your files in ~/lab on the control node are never overwritten by a later start.',
+        '- start and delete print the total time they took.'
+    )
+
+    Write-HelpTitle 'FILES'
+    Write-HelpRow 'Lab data' "$LabPath   (set the LAB_HOME environment variable to move it)" 12
+    Write-HelpRow 'On control' '~/lab/inventory.ini, ansible.cfg, site.yml' 12
+    Write-Host ''
+}
+
+function Show-CommandHelp([string]$Name) {
+    switch ($Name) {
+        'start' {
+            Write-HelpTitle 'START'
+            Write-HelpText @(
+                'Creates the lab the first time. If the lab already exists it powers the VMs on again',
+                'and, if Windows lost it (for example after a reboot), recreates the host network.',
+                'Prints the total time when it is done.'
+            )
+            Write-HelpTitle 'USAGE'
+            Write-HelpText '.\ansibox.ps1 start [options]'
+            Write-HelpTitle 'OPTIONS'
+            Write-HelpRow '--nodes <n>' 'Total nodes, control included: 2 to 11 (default 3 = control + 2 workers).' 22
+            Write-HelpRow '' 'On an existing lab it adds the missing nodes. Nodes are never removed.' 22
+            Write-HelpRow '--distro <os>' 'debian (Debian 13) or rhel (AlmaLinux 9, a free RHEL clone).' 22
+            Write-HelpRow '' 'Asked once if omitted. A lab uses one OS until delete.' 22
+            Write-HelpRow '--memory <size>' 'RAM per VM: 512 MB to 16 GB (default 1024). Sizes: 2048, 2048mb, 2g.' 22
+            Write-HelpRow '' 'A bare number is MB.' 22
+            Write-HelpRow '--memory-mode <m>' 'static (default): fixed RAM per VM.' 22
+            Write-HelpRow '' 'dynamic: Hyper-V resizes it between 512 MB and twice --memory.' 22
+            Write-HelpRow '' 'Asked when VMs are created if omitted. Never saved.' 22
+            Write-HelpRow '--cpus <n>' 'Virtual CPUs per VM: 1 to 8 (default 2).' 22
+            Write-HelpRow '--disk-size <size>' 'Disk per VM: 4 to 200 GB (default 10g). Applied when the OS base image' 22
+            Write-HelpRow '' 'is first prepared; to change it later use: delete --purge.' 22
+            Write-HelpRow '--subnet <cidr>' 'The lab /24 network (default 172.16.10.0/24).' 22
+            Write-HelpRow '--dns <list>' 'DNS servers for the VMs, comma separated (default 1.1.1.1,8.8.8.8).' 22
+            Write-HelpRow '-p, --profile <name>' 'Lab name and VM prefix (default: lab).' 22
+            Write-HelpTitle 'NOTES'
+            Write-HelpText @(
+                '- Sizing options (--memory, --cpus, ...) apply to the VMs this run creates;',
+                '  existing VMs keep their settings.',
+                '- Files you edited in ~/lab on the control node are kept. If a generated file',
+                '  differs from yours, the new version is saved next to it as <name>.new.',
+                '- Creating a lab, or repairing the host network, needs Administrator.',
+                '  Resuming a healthy lab needs Administrator or Hyper-V Administrators membership.'
+            )
+            Write-HelpTitle 'EXAMPLES'
+            Write-HelpExample 'start'
+            Write-HelpExample 'start --distro rhel'
+            Write-HelpExample 'start --distro debian --nodes 4 --memory 2g'
+            Write-HelpExample 'start --memory-mode dynamic'
+            Write-HelpExample 'start --subnet 10.77.5.0/24'
+            Write-HelpExample 'start --nodes 5' 'add nodes to an existing lab'
+        }
+        'status' {
+            Write-HelpTitle 'STATUS'
+            Write-HelpText @(
+                'Lists the lab VMs with their state, operating system, IP address, CPUs and memory.',
+                'The memory column is the startup memory.'
+            )
+            Write-HelpTitle 'USAGE'
+            Write-HelpText '.\ansibox.ps1 status [-p <name>]'
+            Write-HelpTitle 'NOTES'
+            Write-HelpText '- Needs Administrator or membership of the Hyper-V Administrators group.'
+            Write-HelpTitle 'EXAMPLES'
+            Write-HelpExample 'status'
+        }
+        'ssh' {
+            Write-HelpTitle 'SSH'
+            Write-HelpText @(
+                'Opens an SSH session on a node as the user "ansible", with the lab key.',
+                'Without a node name it connects to the control node.'
+            )
+            Write-HelpTitle 'USAGE'
+            Write-HelpText @(
+                '.\ansibox.ps1 ssh [-n <node>]',
+                '.\ansibox.ps1 ssh [<node>]'
+            )
+            Write-HelpTitle 'OPTIONS'
+            Write-HelpRow '-n, --node <node>' 'control (default), node1, node2, ... or the full VM name.' 20
+            Write-HelpTitle 'NOTES'
+            Write-HelpText @(
+                '- Needs no Administrator rights: the IP address of a node is fixed by its name.',
+                '- If you also have Hyper-V access it first checks that the VM exists and is running.',
+                '- Not connecting? Check the lab with: .\ansibox.ps1 status   (and start it with: start).'
+            )
+            Write-HelpTitle 'EXAMPLES'
+            Write-HelpExample 'ssh'                'the control node'
+            Write-HelpExample 'ssh -n node1'
+            Write-HelpExample 'ssh node2'
+        }
+        'stop' {
+            Write-HelpTitle 'STOP'
+            Write-HelpText @(
+                'Shuts down every running lab VM. Disks and data are kept;',
+                '".\ansibox.ps1 start" brings the lab back.'
+            )
+            Write-HelpTitle 'USAGE'
+            Write-HelpText '.\ansibox.ps1 stop [-p <name>]'
+            Write-HelpTitle 'NOTES'
+            Write-HelpText '- Needs Administrator or membership of the Hyper-V Administrators group.'
+            Write-HelpTitle 'EXAMPLES'
+            Write-HelpExample 'stop'
+        }
+        'delete' {
+            Write-HelpTitle 'DELETE'
+            Write-HelpText @(
+                'Removes the lab: its VMs and disks, the virtual switch and the NAT network, and the',
+                'remembered OS choice. The SSH key and the downloaded OS images are kept, so the next',
+                'start is faster. Asks for confirmation. Prints the total time when it is done.'
+            )
+            Write-HelpTitle 'USAGE'
+            Write-HelpText '.\ansibox.ps1 delete [--purge] [--force]'
+            Write-HelpTitle 'OPTIONS'
+            Write-HelpRow '--purge' 'Also delete everything in the lab data folder: the SSH key and the' 24
+            Write-HelpRow '' 'cached OS images (the next start downloads the image again).' 24
+            Write-HelpRow '-f, --force' 'Do not ask for confirmation.' 24
+            Write-HelpRow '-p, --profile <name>' 'Lab name and VM prefix (default: lab).' 24
+            Write-HelpTitle 'NOTES'
+            Write-HelpText @(
+                '- Needs Administrator: it removes the virtual switch and the NAT network.',
+                "- Only VMs named $Prefix-control and $Prefix-node<N> are removed; other VMs are left alone."
+            )
+            Write-HelpTitle 'EXAMPLES'
+            Write-HelpExample 'delete'
+            Write-HelpExample 'delete --force'
+            Write-HelpExample 'delete --purge --force'
+        }
+    }
+    Write-Host ''
+}
+
+# 'help', 'help <command>' and '<command> --help' all end up here.
+function Show-Help([string]$Topic) {
+    if (-not $Topic -and $Rest.Count -gt 0) { $Topic = [string]$Rest[0] }
+    if (-not $Topic) { Show-Usage; return }
+    $name = $Topic.ToLower()
+    if ($CommandAliases.ContainsKey($name)) { $name = $CommandAliases[$name] }
+    if ($name -eq 'help') { Show-Usage; return }
+    if (@('start', 'status', 'ssh', 'stop', 'delete') -notcontains $name) {
+        throw "No help for '$Topic'. Commands: start, status, ssh, stop, delete. Try: .\ansibox.ps1 help"
+    }
+    Show-CommandHelp $name
 }
 
 # ------------------------------------------------------------ interactive menus
@@ -393,7 +643,7 @@ function Read-Choice {
 
     $numbers = (1..$Options.Count) -join ' / '
     while ($true) {
-        $ans = ([string](Read-Host "  > Choose $numbers  (Enter = $defaultLabel)")).Trim().ToLower()
+        $ans = ([string](Read-Answer "  > Choose $numbers  (Enter = $defaultLabel)")).Trim().ToLower()
         if ($ans -eq '') { return $Default }
         for ($i = 0; $i -lt $Options.Count; $i++) {
             $o = $Options[$i]
@@ -502,13 +752,36 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Assert-Administrator {
+# Only called by the commands/steps that really need elevation; $Reason says why.
+function Assert-Administrator([string]$Reason = 'it changes system-level settings') {
     if (-not (Test-IsAdministrator)) {
-        Stop-Prereq 'AnsiBox must be run as Administrator (creating VMs, virtual switches and NAT requires it).' @(
+        Stop-Prereq "'$Command' needs Administrator rights: $Reason." @(
             'Close this window and open PowerShell as Administrator: right-click Start, then choose "Terminal (Admin)" or "Windows PowerShell (Admin)".',
             "Go back to this folder and re-run:  .\ansibox.ps1 $Command"
         )
     }
+}
+
+# Members of the local 'Hyper-V Administrators' group (well-known SID S-1-5-32-578, so it
+# works on any Windows language) can list, start and stop VMs without elevation.
+function Test-IsHyperVAdmin {
+    try {
+        $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+        return $principal.IsInRole((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-578'))
+    } catch { return $false }
+}
+
+function Test-HasHyperVAccess { return ((Test-IsAdministrator) -or (Test-IsHyperVAdmin)) }
+
+# For commands that only manage existing VMs (status, stop, start/resume).
+function Assert-HyperVAccess {
+    if (Test-HasHyperVAccess) { return }
+    Stop-Prereq "'$Command' needs permission to manage Hyper-V virtual machines." @(
+        'Quick way: open PowerShell as Administrator and re-run this command.',
+        'One-time fix, so status/stop/start/ssh never need Administrator again: in an elevated PowerShell run  Add-LocalGroupMember -Group (Get-LocalGroup -SID S-1-5-32-578) -Member $env:USERNAME  then sign out and back in.',
+        "Re-run:  .\ansibox.ps1 $Command"
+    )
 }
 
 # Explains WHY Hyper-V is unavailable: Windows Home, feature not enabled, or restart pending.
@@ -581,6 +854,7 @@ function Assert-HyperV {
         )
     }
     if ($svc.Status -ne 'Running') {
+        Assert-Administrator 'the Hyper-V Virtual Machine Management service (vmms) is stopped and starting a service is an admin task'
         Write-Warn2 'Hyper-V Virtual Machine Management service is stopped - starting it'
         try {
             Start-Service -Name vmms -ErrorAction Stop
@@ -611,7 +885,7 @@ function Assert-HyperV {
         $vmError = $_.Exception.Message
         Assert-HyperVFeature
         Stop-Prereq "Cannot talk to Hyper-V: $vmError" @(
-            'Make sure this is an elevated (Administrator) PowerShell window.',
+            'Make sure this is an elevated (Administrator) PowerShell window, or that your account is in the Hyper-V Administrators group (see: .\ansibox.ps1 help).',
             'If you just enabled Hyper-V, restart the PC.',
             'Check the service:  Get-Service vmms'
         )
@@ -708,6 +982,23 @@ function Remove-LabNetwork {
     }
 }
 
+# Read-only: is the lab network intact (switch + gateway address on the host adapter + NAT)?
+# 'start' uses it when resuming a lab: a healthy network needs no admin rights at all.
+# Anything that cannot be verified counts as "not healthy" (the safe direction: it then asks
+# for Administrator instead of failing half-way).
+function Test-LabNetworkHealthy {
+    try {
+        $alias = "vEthernet ($SwitchName)"
+        if (-not (Get-VMSwitch -Name $SwitchName -ErrorAction SilentlyContinue)) { return $false }
+        $gw = Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+              Where-Object { $_.IPAddress -eq $GatewayIp }
+        if (-not $gw) { return $false }
+        $nat = Get-NetNat -Name $NatName -ErrorAction SilentlyContinue
+        if (-not $nat) { return $false }
+        return ($nat.InternalIPInterfaceAddressPrefix -eq "$Subnet.0/$NetPrefix")
+    } catch { return $false }
+}
+
 function Get-QemuImg {
     $cmd = Get-Command qemu-img -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -799,7 +1090,7 @@ function Initialize-BaseDisk {
     $actual = (Get-FileHash $qcow -Algorithm $Distro.Algo).Hash.ToLower()
     if ($expected -ne $actual) {
         Remove-Item $qcow -Force
-        throw 'Checksum mismatch - corrupted download removed. Re-run to retry.'
+        throw 'Checksum mismatch: the upstream image changed (the "latest" alias is rebuilt regularly) or the download was corrupted. The cached copy was removed - re-run to fetch a fresh one.'
     }
     Write-Ok 'Checksum OK'
 
@@ -894,6 +1185,9 @@ function New-UserData([string]$HostName, [bool]$IsControl, [string]$PubKey) {
     }
     $l += 'runcmd:'
     foreach ($c in $Distro.RunCmd) { $l += "  - $c" }
+    if ($IsControl) {
+        foreach ($c in @($Distro.ControlRunCmd)) { $l += "  - $c" }
+    }
     return (($l -join "`n") + "`n")
 }
 
@@ -1109,6 +1403,7 @@ function Get-LabVmDirs {
 
 # ------------------------------------------------------------------ actions
 function Invoke-Up {
+    Assert-Administrator 'creating a lab sets up the virtual switch, the NAT network and the host IP address'
     Test-Prerequisites
 
     # Which OS? Asked once, when the lab is first created (or taken from --distro / the existing
@@ -1173,6 +1468,7 @@ function Invoke-Up {
     Write-Host "  Then run:  cd ~/lab && ansible all -m ping"
     Write-Host "             ansible-playbook site.yml"
     Write-Host "  Tear down: .\ansibox.ps1 delete"
+    Write-Elapsed
 }
 
 function Invoke-Status {
@@ -1200,12 +1496,22 @@ function Invoke-SshAction {
     }
     $name = $Target
     if ($name -notlike "$Prefix-*") { $name = "$Prefix-$name" }
-    $vm = Get-VM -Name $name -ErrorAction SilentlyContinue
-    if (-not $vm) { throw "VM '$name' not found. Try: .\ansibox.ps1 status" }
-    if ($vm.State -ne 'Running') { throw "$name is not running. Try: .\ansibox.ps1 start" }
+
+    # The IP is fixed by the VM name, so plain SSH needs no Hyper-V call and no elevation.
+    # When we are allowed to ask Hyper-V (admin / Hyper-V Administrators), check first so the
+    # error is precise; otherwise just connect and explain if that fails.
+    $canAsk = (Test-HasHyperVAccess) -and [bool](Get-Command Get-VM -ErrorAction SilentlyContinue)
+    if ($canAsk) {
+        $vm = Get-VM -Name $name -ErrorAction SilentlyContinue
+        if (-not $vm) { throw "VM '$name' not found. Try: .\ansibox.ps1 status" }
+        if ($vm.State -ne 'Running') { throw "$name is not running. Try: .\ansibox.ps1 start" }
+    }
     $ip = Get-LabIp $name
     Clear-KnownHost $ip
-    & ssh @BaseOpts "$LabUser@$ip"
+    & ssh @BaseOpts -o ConnectTimeout=10 "$LabUser@$ip"
+    if ($LASTEXITCODE -eq 255) {
+        Write-Warn2 "Could not connect to $name ($ip). Is the lab running? Try: .\ansibox.ps1 start  (and .\ansibox.ps1 status)"
+    }
 }
 
 function Invoke-Destroy {
@@ -1218,7 +1524,7 @@ function Invoke-Destroy {
     if (-not $Force) {
         $list = if ($vms) { ' [' + ((@($vms) | ForEach-Object { $_.Name }) -join ', ') + ']' } else { '' }
         $what = if ($Purge) { "ALL lab VMs$list, the lab switch/NAT and everything in $LabPath (keys + cached images)" } else { "all lab VMs$list, their disks and the lab switch/NAT" }
-        $ans = Read-Host "This will delete $what. Continue? [y/N]"
+        $ans = Read-Answer "This will delete $what. Continue? [y/N]"
         if ($ans -notmatch '^(y|yes)$') { Write-Host 'Aborted.'; return }
     }
 
@@ -1243,31 +1549,51 @@ function Invoke-Destroy {
         Remove-Item $LabPath -Recurse -Force
     }
     Write-Ok 'Done.'
+    Write-Elapsed
 }
 
 function Invoke-Start {
-    Initialize-LabNetwork      # switch/NAT are recreated if the host lost them (e.g. after a reboot)
+    # Switch/NAT are recreated if the host lost them (e.g. after a reboot). Only that repair
+    # needs Administrator; with a healthy network, powering the VMs on needs no elevation.
+    if (-not (Test-LabNetworkHealthy)) {
+        Assert-Administrator 'the lab network (virtual switch / NAT / host address) is missing or incomplete and has to be recreated'
+        Initialize-LabNetwork
+    }
     Get-LabVms | Where-Object State -ne 'Running' | Start-VM
     Write-Ok 'Started.'
+    Write-Elapsed
 }
 
-# minikube's "start" creates the cluster if it doesn't exist and resumes it if it does.
+# 'start' creates the lab if it doesn't exist and resumes it if it does.
 # Resuming only powers the VMs on; it does not touch the files in ~/lab on the control node.
 function Invoke-StartCmd {
     if ((Get-LabVms) -and -not $Flags.ContainsKey('nodes')) { Invoke-Start } else { Invoke-Up }
 }
 
 # --------------------------------------------------------------------- main
-if ($Flags.ContainsKey('help')) { $Command = 'help' }
+$CommandTimer.Start()
+# 'help', 'help <command>' and '<command> --help' all show the manual.
+$HelpTopic = $null
+if ($Flags.ContainsKey('help')) {
+    if ($Command -ne 'help') { $HelpTopic = $Command }
+    $Command = 'help'
+}
 
 if (@('start', 'stop', 'status', 'ssh', 'delete', 'help') -notcontains $Command) {
     throw "Unknown command '$Command'. Try: .\ansibox.ps1 help"
 }
 
-# 'help' works anywhere. Everything else needs Administrator rights and a working Hyper-V.
-if ($Command -ne 'help') {
-    Assert-Administrator
-    Assert-HyperV
+# 'help' works anywhere. Every other command asks only for the rights it really needs:
+#   ssh              nothing: plain SSH to a fixed IP, no Hyper-V call at all
+#   status, stop     permission to manage VMs: Administrator OR the 'Hyper-V Administrators' group
+#   start            the same to resume; Administrator is asked later, only if the lab network
+#                    has to be recreated (Invoke-Start) or a lab has to be built (Invoke-Up)
+#   delete           Administrator: it removes the virtual switch and the NAT network
+switch ($Command) {
+    'help'   { }
+    'ssh'    { }
+    'delete' { Assert-Administrator 'deleting a lab removes its virtual switch and NAT network'; Assert-HyperV }
+    default  { Assert-HyperVAccess; Assert-HyperV }      # start, status, stop
 }
 
 switch ($Command) {
@@ -1276,6 +1602,6 @@ switch ($Command) {
     'ssh'    { Invoke-SshAction }
     'stop'   { Get-LabVms | Where-Object State -eq 'Running' | Stop-VM; Write-Ok 'Stopped.' }
     'delete' { Invoke-Destroy }
-    'help'   { Show-Usage }
+    'help'   { Show-Help $HelpTopic }
     default  { throw "Unknown command '$Command'. Try: .\ansibox.ps1 help" }
 }
