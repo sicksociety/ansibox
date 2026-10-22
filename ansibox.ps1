@@ -7,9 +7,18 @@
     One-command Ansible home lab on Hyper-V (a "minikube" for Ansible).
 
 .DESCRIPTION
-    Builds a control node (Ansible preinstalled) plus worker nodes from the
-    official Debian 13 "genericcloud" image. Every VM is a differencing disk on
-    one shared base image, so extra nodes cost almost no disk space.
+    Builds a control node (Ansible preinstalled) plus worker nodes from an official
+    cloud image. Two operating systems are supported:
+
+        debian   Debian 13 "Trixie"  (official "genericcloud" image)
+        rhel     AlmaLinux 9         (official "GenericCloud" image) - the Red Hat family:
+                 free, no subscription or license, binary-compatible with RHEL.
+
+    The OS is asked ONCE, the first time a lab is created (or pass --distro to skip the
+    question). It is remembered for that lab until you run 'delete'.
+
+    Every VM is a differencing disk on one shared base image per OS, so extra nodes cost
+    almost no disk space.
 
     The command line copies minikube: same verbs (start, stop, status, ssh,
     delete) and the same flags where they make sense. Both "--nodes 3" and
@@ -28,8 +37,9 @@
         172.16.10.4   lab-node2   ...and so on
 
 .EXAMPLE
-    .\ansibox.ps1 start                          # 3 nodes: control + 2 workers
-    .\ansibox.ps1 start --nodes 4 --memory 2g
+    .\ansibox.ps1 start                          # asks for the OS, then 3 nodes: control + 2 workers
+    .\ansibox.ps1 start --distro rhel            # AlmaLinux 9, no question
+    .\ansibox.ps1 start --distro debian --nodes 4 --memory 2g
     .\ansibox.ps1 start --subnet 10.77.5.0/24    # use another /24
     .\ansibox.ps1 start --memory-mode dynamic    # skip the memory question
     .\ansibox.ps1 status
@@ -83,7 +93,92 @@ function Assert-Range([string]$Flag, [int]$Value, [int]$Min, [int]$Max, [string]
     }
 }
 
-$ValueFlags  = 'nodes', 'node', 'memory', 'memory-mode', 'cpus', 'disk-size', 'subnet', 'dns', 'profile'
+# ------------------------------------------------------- supported operating systems
+# One entry per OS family. Everything that differs between Debian and Red Hat style
+# systems lives here, so the rest of the script stays distro-neutral:
+#   image + checksum location, admin group, cloud-init packages, the Hyper-V guest
+#   service, the default-route spelling and the package task of the smoke-test playbook.
+#
+# 'rhel' = AlmaLinux 9: a free, 1:1 rebuild of RHEL (no subscription, no license), shipped
+# as an official minimal cloud image with cloud-init. ansible-core comes straight from the
+# AppStream repo, so no EPEL is needed. To use AlmaLinux 10 instead, change ImageBase and
+# BaseId (note: the plain AlmaLinux 10 x86_64 image needs a CPU with x86-64-v3).
+$DefaultDistro = 'debian'
+$Distros = [ordered]@{
+    debian = @{
+        Name            = 'Debian 13 "Trixie"'
+        Short           = 'Debian 13'
+        Label           = 'Debian 13 "Trixie"'
+        Aliases         = @('debian', 'deb', 'd')
+        Detail          = @(
+            'Debian family  |  apt  |  official "genericcloud" image (small download)',
+            'Light and quick to boot - a great default for Ansible practice.'
+        )
+        BaseId          = 'debian-13'
+        ImageBase       = 'https://cloud.debian.org/images/cloud/trixie/latest'
+        ImageName       = 'debian-13-genericcloud-amd64.qcow2'
+        SumsFile        = 'SHA512SUMS'
+        Algo            = 'SHA512'
+        AdminGroup      = 'sudo'
+        DefaultRoute    = 'default'
+        MinMemoryMB     = 512
+        Packages        = @('hyperv-daemons')
+        ControlPackages = @('ansible')
+        RunCmd          = @('systemctl enable --now hv-kvp-daemon.service || true')
+        SmokeTask       = @(
+            '    - name: Install htop',
+            '      ansible.builtin.apt:',
+            '        name: htop',
+            '        state: present',
+            '        update_cache: true'
+        )
+    }
+    rhel = @{
+        Name            = 'AlmaLinux 9 (Red Hat family)'
+        Short           = 'AlmaLinux 9'
+        Label           = 'AlmaLinux 9  (Red Hat family, RHEL-compatible)'
+        Aliases         = @('rhel', 'redhat', 'red-hat', 'almalinux', 'alma', 'el', 'r')
+        Detail          = @(
+            'Red Hat family  |  dnf  |  official "GenericCloud" image (~560 MB download)',
+            'Free: no subscription, no license - binary-compatible with RHEL.',
+            'Same tooling as RHEL / Rocky / CentOS Stream: dnf, SELinux, systemd.'
+        )
+        BaseId          = 'almalinux-9'
+        ImageBase       = 'https://repo.almalinux.org/almalinux/9/cloud/x86_64/images'
+        ImageName       = 'AlmaLinux-9-GenericCloud-latest.x86_64.qcow2'
+        SumsFile        = 'CHECKSUM'
+        Algo            = 'SHA256'
+        AdminGroup      = 'wheel'
+        DefaultRoute    = '0.0.0.0/0'
+        MinMemoryMB     = 1024
+        Packages        = @()
+        ControlPackages = @('ansible-core')
+        # hyperv-daemons is installed here (not in 'packages:') so that a missing package
+        # can never make cloud-init skip ansible-core.
+        RunCmd          = @(
+            'dnf -y install hyperv-daemons || true',
+            'systemctl enable --now hypervkvpd.service || true'
+        )
+        SmokeTask       = @(
+            '    - name: Install tmux',
+            '      ansible.builtin.dnf:',
+            '        name: tmux',
+            '        state: present',
+            '        update_cache: true'
+        )
+    }
+}
+
+# Accepts the key or any alias (--distro rhel | redhat | almalinux | alma | debian ...)
+function ConvertTo-DistroKey([string]$Text) {
+    $t = $Text.Trim().ToLower()
+    foreach ($k in $Distros.Keys) {
+        if ($t -eq $k -or ($Distros[$k].Aliases -contains $t)) { return $k }
+    }
+    throw "--distro must be 'debian' or 'rhel' (also accepted: almalinux, alma, redhat). Got '$Text'."
+}
+
+$ValueFlags  = 'nodes', 'node', 'memory', 'memory-mode', 'cpus', 'disk-size', 'subnet', 'dns', 'profile', 'distro'
 $SwitchFlags = 'force', 'purge', 'help'
 # Short flags. As in minikube, -n is --nodes for 'start' but --node for 'ssh'.
 $ShortFlags  = @{ p = 'profile'; f = 'force'; h = 'help'; n = 'nodes' }
@@ -134,6 +229,10 @@ Assert-Range 'memory'    $MemoryMB 512 16384 'MB'
 Assert-Range 'disk-size' $DiskGB   4   200   'GB'
 $Workers = $Nodes - 1
 
+# OS requested on the command line (or $null = ask the first time the lab is created)
+$DistroFlag = Get-Flag 'distro' $null
+if ($null -ne $DistroFlag) { $DistroFlag = ConvertTo-DistroKey ([string]$DistroFlag) }
+
 # Memory mode for the VMs this run creates. The script default is stored first in
 # $DefaultMemoryMode; --memory-mode (or the question asked when VMs are created) overrides it
 # for this run only. Nothing is saved, so the next run starts from the default again.
@@ -172,14 +271,17 @@ $Purge  = $Flags.ContainsKey('purge')
 $Target = if ($Flags.ContainsKey('node')) { $Flags['node'] } elseif ($Rest.Count -gt 0) { $Rest[0] } else { 'control' }
 
 # ---------------------------------------------------------------- constants
-$ImageBase = 'https://cloud.debian.org/images/cloud/trixie/latest'
-$ImageName = 'debian-13-genericcloud-amd64.qcow2'
-$ImgDir    = "$LabPath\images"
-$VmDir     = "$LabPath\vms"
-$KeyPath   = "$LabPath\lab_key"
-$KnownHost = "$LabPath\known_hosts"
-$BaseVhdx  = "$ImgDir\debian-13-base.vhdx"
-$LabUser   = 'ansible'
+$ImgDir     = "$LabPath\images"
+$VmDir      = "$LabPath\vms"
+$KeyPath    = "$LabPath\lab_key"
+$KnownHost  = "$LabPath\known_hosts"
+$DistroFile = "$LabPath\$Prefix.distro"     # remembers which OS this lab was built with
+$LabUser    = 'ansible'
+
+# Filled in by Set-ActiveDistro once the OS of the lab is known (start only).
+$DistroKey = $null
+$Distro    = $null
+$BaseVhdx  = $null
 
 $SwitchName = "$Prefix-net"
 $NatName    = "$Prefix-nat"
@@ -202,6 +304,7 @@ function Show-Usage {
 Ansible lab on Hyper-V
 
   .\ansibox.ps1 start   [--nodes 3] [--memory 1024] [--cpus 2] [--disk-size 10g]
+                     [--distro debian|rhel]
                      [--subnet 172.16.10.0/24] [--dns 1.1.1.1,8.8.8.8]
                      [--memory-mode static|dynamic]
   .\ansibox.ps1 status
@@ -212,6 +315,10 @@ Ansible lab on Hyper-V
 Global flag:  -p, --profile <name>   lab name / VM prefix (default: lab)
 Sizes:        2048 = 2048mb = 2g (a bare number is MB, as in minikube)
 --nodes:      total node count, control included (3 = control + 2 workers)
+--distro:     debian = Debian 13 "Trixie"   (apt)
+              rhel   = AlmaLinux 9, Red Hat family, free RHEL clone (dnf)
+              Without the flag you are asked the first time the lab is created.
+              The choice is remembered until 'delete'; a lab uses a single OS.
 --memory-mode: static (default) = fixed RAM per VM; dynamic = Hyper-V resizes it between
               512 MB and twice --memory. Without the flag you are asked when VMs are created.
               The choice applies to that run only and is not saved.
@@ -224,6 +331,155 @@ Fixed IPs:  $Subnet.1 host/gateway, $Subnet.2 control, $Subnet.3 node1, $Subnet.
 Run from an elevated (Administrator) PowerShell.
 Lab data lives in: $LabPath
 "@ | Write-Host
+}
+
+# ------------------------------------------------------------ interactive menus
+# Can we ask the user something? (not when input is redirected, e.g. CI / piped runs)
+function Test-CanAsk {
+    return ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected)
+}
+
+# One reusable, framed multiple-choice question. ASCII only on purpose: box-drawing
+# characters get mangled by Windows PowerShell 5.1 when a script has no BOM.
+#   $Options: array of @{ Value; Label; Aliases; Detail = @('line', ...) }
+#   Enter alone returns $Default. Typing the number, the value or any alias also works.
+#
+#   +----------------------------------------------------------------+
+#   |  Choose your lab operating system                              |
+#   +----------------------------------------------------------------+
+#   Asked once - the lab keeps this OS until you run "delete".
+#
+#    [1]  Debian 13 "Trixie"   (default)
+#         Debian family  |  apt  |  ...
+#
+#    [2]  AlmaLinux 9  (Red Hat family, RHEL-compatible)
+#         ...
+#
+#   > Choose 1 / 2  (Enter = Debian 13 "Trixie"):
+function Read-Choice {
+    param(
+        [string]$Title,
+        [string]$Subtitle,
+        [hashtable[]]$Options,
+        [string]$Default
+    )
+
+    $inner = [math]::Max(64, $Title.Length + 6)
+    $bar   = '+' + ('-' * $inner) + '+'
+    $head  = ("  $Title").PadRight($inner)
+    Write-Host ''
+    Write-Host "  $bar" -ForegroundColor Cyan
+    Write-Host '  |' -NoNewline -ForegroundColor Cyan
+    Write-Host $head -NoNewline -ForegroundColor Yellow
+    Write-Host '|' -ForegroundColor Cyan
+    Write-Host "  $bar" -ForegroundColor Cyan
+    if ($Subtitle) { Write-Host "  $Subtitle" -ForegroundColor Gray }
+    Write-Host ''
+
+    $defaultLabel = ''
+    for ($i = 0; $i -lt $Options.Count; $i++) {
+        $o = $Options[$i]
+        $isDefault = ($o.Value -eq $Default)
+        if ($isDefault) { $defaultLabel = $o.Label }
+
+        Write-Host '   ' -NoNewline
+        Write-Host ('[{0}]' -f ($i + 1)) -NoNewline -ForegroundColor Yellow
+        Write-Host "  $($o.Label)" -NoNewline -ForegroundColor White
+        if ($isDefault) { Write-Host '   (default)' -NoNewline -ForegroundColor Green }
+        Write-Host ''
+        foreach ($d in $o.Detail) { Write-Host "        $d" -ForegroundColor DarkGray }
+        Write-Host ''
+    }
+
+    $numbers = (1..$Options.Count) -join ' / '
+    while ($true) {
+        $ans = ([string](Read-Host "  > Choose $numbers  (Enter = $defaultLabel)")).Trim().ToLower()
+        if ($ans -eq '') { return $Default }
+        for ($i = 0; $i -lt $Options.Count; $i++) {
+            $o = $Options[$i]
+            $accepted = @("$($i + 1)", ([string]$o.Value).ToLower()) + @($o.Aliases)
+            if ($accepted -contains $ans) { return $o.Value }
+        }
+        Write-Warn2 "Please type $numbers, or just press Enter for the default."
+    }
+}
+
+# Which OS should this (new) lab use? Built from the $Distros catalog.
+function Read-DistroChoice {
+    if (-not (Test-CanAsk)) { return $DefaultDistro }
+
+    $opts = @()
+    foreach ($k in $Distros.Keys) {
+        $d = $Distros[$k]
+        $opts += , @{ Value = $k; Label = $d.Label; Aliases = $d.Aliases; Detail = $d.Detail }
+    }
+    return (Read-Choice -Title 'Choose your lab operating system' `
+                        -Subtitle 'Asked once - the lab keeps this OS until you run "delete".' `
+                        -Options $opts -Default $DefaultDistro)
+}
+
+# Static vs dynamic memory for the VMs this run is about to create.
+#   - --memory-mode on the command line wins: nothing is asked.
+#   - Otherwise the user is asked; just pressing Enter keeps the script default.
+#   - With nobody to ask (input redirected, CI) the default is used.
+# The answer lives in $MemoryMode for this run only. It is never saved.
+function Read-MemoryMode {
+    if ($Flags.ContainsKey('memory-mode')) { return $MemoryMode }
+    if (-not (Test-CanAsk)) { return $DefaultMemoryMode }
+
+    $opts = @(
+        @{ Value = 'static';  Label = 'Static';  Aliases = @('s', 'static')
+           Detail = @("Fixed $MemoryMB MB of RAM per VM",
+                      'Predictable: what you set is what every VM gets.') },
+        @{ Value = 'dynamic'; Label = 'Dynamic'; Aliases = @('d', 'dynamic')
+           Detail = @("Starts at $MemoryMB MB; Hyper-V resizes it between $DynMinMB and $DynMaxMB MB",
+                      'Idle VMs give RAM back to the host.') }
+    )
+    return (Read-Choice -Title 'Memory mode for the new VMs' `
+                        -Subtitle 'How should Hyper-V hand out RAM? (applies to this run only)' `
+                        -Options $opts -Default $DefaultMemoryMode)
+}
+
+# ------------------------------------------------------ OS selection / persistence
+function Get-SavedDistroKey {
+    if (-not (Test-Path $DistroFile)) { return $null }
+    $t = ([string](Get-Content $DistroFile -Raw -ErrorAction SilentlyContinue)).Trim().ToLower()
+    if ($Distros.Contains($t)) { return $t }
+    return $null
+}
+
+# The OS of an existing lab. Labs built before multi-OS support have no marker file: Debian.
+function Get-LabDistroKey {
+    $saved = Get-SavedDistroKey
+    if ($saved) { return $saved }
+    return 'debian'
+}
+
+function Save-DistroChoice {
+    New-Item -ItemType Directory -Force $LabPath | Out-Null
+    [IO.File]::WriteAllText($DistroFile, $DistroKey, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Set-ActiveDistro([string]$Key) {
+    $script:DistroKey = $Key
+    $script:Distro    = $Distros[$Key]
+    $script:BaseVhdx  = "$ImgDir\$($Distro.BaseId)-base.vhdx"
+}
+
+# Decide the OS for 'start':
+#   - lab already has VMs  -> keep its OS (a lab never mixes distros); a conflicting --distro is an error
+#   - brand-new lab        -> --distro if given, otherwise ask (default Debian when nobody can answer)
+function Resolve-Distro {
+    $existing = Get-LabVms
+    if ($existing) {
+        $current = Get-LabDistroKey
+        if ($DistroFlag -and $DistroFlag -ne $current) {
+            throw "This lab already runs $($Distros[$current].Name), and a lab uses a single OS. Run '.\ansibox.ps1 delete' first if you want $($Distros[$DistroFlag].Name)."
+        }
+        return $current
+    }
+    if ($DistroFlag) { return $DistroFlag }
+    return (Read-DistroChoice)
 }
 
 # ------------------------------------------------------ prerequisite checks
@@ -510,23 +766,37 @@ function Repair-VhdxFile([string]$Path) {
     }
 }
 
+# Find the expected checksum of $FileName in a checksum file. Understands both layouts:
+#   GNU  (Debian SHA512SUMS):   <hash>  <file>
+#   BSD  (AlmaLinux CHECKSUM):  SHA256 (<file>) = <hash>      (comment lines are ignored)
+function Get-ExpectedHash([string[]]$Lines, [string]$FileName, [string]$Algo) {
+    $name = [regex]::Escape($FileName)
+    foreach ($ln in $Lines) {
+        if ($ln -match "^\s*$Algo\s*\($name\)\s*=\s*([0-9a-fA-F]{32,})\s*$") { return $Matches[1].ToLower() }
+        if ($ln -match "^\s*([0-9a-fA-F]{32,})\s+\*?$name\s*$")             { return $Matches[1].ToLower() }
+    }
+    return $null
+}
+
+# Builds the shared base disk of the selected OS (one VHDX per OS, built once).
 function Initialize-BaseDisk {
     if (Test-Path $BaseVhdx) { return }
     New-Item -ItemType Directory -Force $ImgDir | Out-Null
-    $qcow = "$ImgDir\$ImageName"
+    $imageName = $Distro.ImageName
+    $qcow      = "$ImgDir\$imageName"
 
     if (-not (Test-Path $qcow)) {
-        Write-Step "Downloading $ImageName (one time)"
-        & curl.exe -fL --progress-bar -o $qcow "$ImageBase/$ImageName"
+        Write-Step "Downloading $imageName (one time)"
+        & curl.exe -fL --progress-bar -o $qcow "$($Distro.ImageBase)/$imageName"
         if ($LASTEXITCODE -ne 0) { Remove-Item $qcow -ErrorAction SilentlyContinue; throw 'Image download failed.' }
     }
 
-    Write-Step 'Verifying SHA512 checksum'
-    $sums = & curl.exe -fsSL "$ImageBase/SHA512SUMS"
-    $line = $sums | Where-Object { $_ -match ([regex]::Escape($ImageName) + '$') } | Select-Object -First 1
-    if (-not $line) { throw 'Could not find the image in SHA512SUMS.' }
-    $expected = ($line -split '\s+')[0].ToLower()
-    $actual   = (Get-FileHash $qcow -Algorithm SHA512).Hash.ToLower()
+    Write-Step "Verifying $($Distro.Algo) checksum"
+    $sums = & curl.exe -fsSL "$($Distro.ImageBase)/$($Distro.SumsFile)"
+    if ($LASTEXITCODE -ne 0) { throw "Could not download $($Distro.SumsFile) to verify the image." }
+    $expected = Get-ExpectedHash -Lines @($sums) -FileName $imageName -Algo $Distro.Algo
+    if (-not $expected) { throw "Could not find $imageName in $($Distro.SumsFile)." }
+    $actual = (Get-FileHash $qcow -Algorithm $Distro.Algo).Hash.ToLower()
     if ($expected -ne $actual) {
         Remove-Item $qcow -Force
         throw 'Checksum mismatch - corrupted download removed. Re-run to retry.'
@@ -537,7 +807,7 @@ function Initialize-BaseDisk {
     $qemu = Get-QemuImg
     # NOTE: the temp file must keep a .vhdx extension - the Hyper-V disk cmdlets
     # (Get-VHD / Resize-VHD) key off the extension.
-    $tmp  = "$ImgDir\debian-13-base.building.vhdx"
+    $tmp  = "$ImgDir\$($Distro.BaseId)-base.building.vhdx"
     Remove-Item $tmp -ErrorAction SilentlyContinue
     & $qemu convert -O vhdx -o subformat=dynamic -p $qcow $tmp
     if ($LASTEXITCODE -ne 0) { throw 'qemu-img convert failed.' }
@@ -598,26 +868,32 @@ function New-SeedIso([string]$Dir, [string]$UserData, [string]$MetaData, [string
     return $iso
 }
 
+# cloud-init user-data. Package names, admin group and Hyper-V guest service come from the
+# selected OS entry in $Distros (Debian: sudo/apt/ansible, Red Hat family: wheel/dnf/ansible-core).
 function New-UserData([string]$HostName, [bool]$IsControl, [string]$PubKey) {
+    $pkgs = @($Distro.Packages)
+    if ($IsControl) { $pkgs += @($Distro.ControlPackages) }
+
     $l = @(
         '#cloud-config',
         "hostname: $HostName",
         'users:',
         "  - name: $LabUser",
         '    gecos: Ansible lab user',
-        '    groups: [sudo]',
+        "    groups: [$($Distro.AdminGroup)]",
         '    sudo: ALL=(ALL) NOPASSWD:ALL',
         '    shell: /bin/bash',
         '    lock_passwd: true',
         '    ssh_authorized_keys:',
         "      - $PubKey",
-        'package_update: true',
-        'packages:',
-        '  - hyperv-daemons'
+        'package_update: true'
     )
-    if ($IsControl) { $l += '  - ansible' }
+    if ($pkgs.Count -gt 0) {
+        $l += 'packages:'
+        foreach ($p in $pkgs) { $l += "  - $p" }
+    }
     $l += 'runcmd:'
-    $l += '  - systemctl enable --now hv-kvp-daemon.service || true'
+    foreach ($c in $Distro.RunCmd) { $l += "  - $c" }
     return (($l -join "`n") + "`n")
 }
 
@@ -636,7 +912,7 @@ function New-NetworkConfig([string]$Ip, [string]$Mac) {
         '    addresses:',
         "      - $Ip/$NetPrefix",
         '    routes:',
-        '      - to: default',
+        "      - to: $($Distro.DefaultRoute)",
         "        via: $GatewayIp",
         '    nameservers:',
         '      addresses:'
@@ -737,8 +1013,9 @@ function Copy-ToRemote([string]$Ip, [string]$Local, [string]$Remote) {
 }
 
 # SSH answers as soon as cloud-init has created the user and key, which is BEFORE its package
-# stage (hyperv-daemons, ansible) finishes. Until then apt holds the dpkg lock, so a playbook
-# run right after 'start' could fail. Block until cloud-init is done, with an upper limit.
+# stage (hyperv-daemons, ansible) finishes. Until then the package manager holds its lock
+# (apt/dpkg or dnf), so a playbook run right after 'start' could fail. Block until cloud-init
+# is done, with an upper limit.
 function Wait-CloudInit([string]$Name, [string]$Ip, [int]$TimeoutSec = 900) {
     $rc = Invoke-Remote $Ip "timeout $TimeoutSec cloud-init status --wait >/dev/null 2>&1"
     # 0 = done, 2 = done with recoverable warnings (not worth alarming anyone about)
@@ -772,7 +1049,7 @@ function Send-LabFile([string]$Ip, [string]$LocalPath, [string]$RemoteName) {
 function Set-ControlNode([string]$ControlIp, [hashtable]$WorkerIps, [string]$ControlName) {
     Write-Step 'Configuring the control node'
     if ((Invoke-Remote $ControlIp 'command -v ansible >/dev/null') -ne 0) {
-        Write-Warn2 'Ansible is not installed on control yet (apt may have failed). Check: sudo cloud-init status --long'
+        Write-Warn2 'Ansible is not installed on control yet (the package install may have failed). Check: sudo cloud-init status --long'
     }
 
     $inv = @("[control]", "$ControlName ansible_connection=local", "", "[nodes]")
@@ -785,17 +1062,14 @@ function Set-ControlNode([string]$ControlIp, [hashtable]$WorkerIps, [string]$Con
 
     $cfg = @('[defaults]', 'inventory = ./inventory.ini', 'host_key_checking = False', 'interpreter_python = auto_silent')
 
+    # The package task differs per OS family (apt vs dnf); everything else is shared.
     $play = @(
         '---',
         '- name: Smoke test for the lab',
         '  hosts: nodes',
         '  become: true',
-        '  tasks:',
-        '    - name: Install htop',
-        '      ansible.builtin.apt:',
-        '        name: htop',
-        '        state: present',
-        '        update_cache: true',
+        '  tasks'  + ':'
+    ) + @($Distro.SmokeTask) + @(
         '    - name: Say hello',
         '      ansible.builtin.debug:',
         '        msg: "Hello from {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"'
@@ -833,36 +1107,21 @@ function Get-LabVmDirs {
     @(Get-ChildItem $VmDir -Directory -ErrorAction SilentlyContinue | Where-Object { Test-LabVmName $_.Name })
 }
 
-# Static vs dynamic memory for the VMs this run is about to create.
-#   - --memory-mode on the command line wins: nothing is asked.
-#   - Otherwise the user is asked; just pressing Enter keeps the script default.
-#   - With nobody to ask (input redirected, CI) the default is used.
-# The answer lives in $MemoryMode for this run only. It is never saved.
-function Read-MemoryMode {
-    if ($Flags.ContainsKey('memory-mode')) { return $MemoryMode }
-    if (-not [Environment]::UserInteractive -or [Console]::IsInputRedirected) { return $DefaultMemoryMode }
-
-    $sTag = if ($DefaultMemoryMode -eq 'static')  { '  (default)' } else { '' }
-    $dTag = if ($DefaultMemoryMode -eq 'dynamic') { '  (default)' } else { '' }
-    Write-Host ''
-    Write-Host 'Memory mode for the new VMs:'
-    Write-Host "  [S] Static   fixed $MemoryMB MB per VM$sTag"
-    Write-Host "  [D] Dynamic  starts at $MemoryMB MB, Hyper-V resizes it between $DynMinMB and $DynMaxMB MB$dTag"
-    while ($true) {
-        $ans = ([string](Read-Host "Choose S or D (Enter = $DefaultMemoryMode)")).Trim().ToLower()
-        if ($ans -eq '')                         { return $DefaultMemoryMode }
-        if ($ans -eq 's' -or $ans -eq 'static')  { return 'static' }
-        if ($ans -eq 'd' -or $ans -eq 'dynamic') { return 'dynamic' }
-        Write-Warn2 "Please answer S or D (or press Enter for $DefaultMemoryMode)."
-    }
-}
-
 # ------------------------------------------------------------------ actions
 function Invoke-Up {
     Test-Prerequisites
 
-    # Ask about memory first, so the long steps below (image download, first boot) run unattended.
-    # Only asked when this run will actually create VMs; existing VMs keep their settings.
+    # Which OS? Asked once, when the lab is first created (or taken from --distro / the existing
+    # lab). Done before the long steps so the rest of the run is unattended.
+    Set-ActiveDistro (Resolve-Distro)
+    Save-DistroChoice
+    Write-Ok "OS: $($Distro.Name)"
+    if ($MemoryMB -lt $Distro.MinMemoryMB) {
+        Write-Warn2 "$($Distro.Short) needs about $($Distro.MinMemoryMB) MB per VM to install packages reliably (you asked for $MemoryMB MB). Consider --memory $($Distro.MinMemoryMB)."
+    }
+
+    # Ask about memory next. Only asked when this run will actually create VMs;
+    # existing VMs keep their settings.
     $labNames = @("$Prefix-control") + @(1..$Workers | ForEach-Object { "$Prefix-node$_" })
     $newVms   = @($labNames | Where-Object { -not (Get-VM -Name $_ -ErrorAction SilentlyContinue) })
     if ($newVms.Count -gt 0) {
@@ -909,7 +1168,7 @@ function Invoke-Up {
     Set-ControlNode -ControlIp $ips[$control] -WorkerIps $workerIps -ControlName $control
 
     Write-Host ''
-    Write-Host 'Lab is ready.' -ForegroundColor Green
+    Write-Host "Lab is ready.  ($($Distro.Name))" -ForegroundColor Green
     Write-Host "  Connect:   .\ansibox.ps1 ssh      (or: ssh -i `"$KeyPath`" $LabUser@$($ips[$control]))"
     Write-Host "  Then run:  cd ~/lab && ansible all -m ping"
     Write-Host "             ansible-playbook site.yml"
@@ -919,10 +1178,12 @@ function Invoke-Up {
 function Invoke-Status {
     $vms = Get-LabVms
     if (-not $vms) { Write-Host 'No lab VMs found. Run: .\ansibox.ps1 start'; return }
+    $os = $Distros[(Get-LabDistroKey)].Short
     $vms | ForEach-Object {
         [pscustomobject]@{
             Name     = $_.Name
             State    = $_.State
+            OS       = $os
             IP       = Get-LabIp $_.Name
             CPUs     = $_.ProcessorCount
             MemoryMB = [int]($_.MemoryStartup / 1MB)
@@ -956,7 +1217,7 @@ function Invoke-Destroy {
 
     if (-not $Force) {
         $list = if ($vms) { ' [' + ((@($vms) | ForEach-Object { $_.Name }) -join ', ') + ']' } else { '' }
-        $what = if ($Purge) { "ALL lab VMs$list, the lab switch/NAT and everything in $LabPath (keys + cached image)" } else { "all lab VMs$list, their disks and the lab switch/NAT" }
+        $what = if ($Purge) { "ALL lab VMs$list, the lab switch/NAT and everything in $LabPath (keys + cached images)" } else { "all lab VMs$list, their disks and the lab switch/NAT" }
         $ans = Read-Host "This will delete $what. Continue? [y/N]"
         if ($ans -notmatch '^(y|yes)$') { Write-Host 'Aborted.'; return }
     }
@@ -971,10 +1232,14 @@ function Invoke-Destroy {
     foreach ($d in (Get-LabVmDirs)) { Remove-Item $d.FullName -Recurse -Force -ErrorAction SilentlyContinue }
     Remove-LabNetwork
     Remove-Item $KnownHost -Force -ErrorAction SilentlyContinue
+    # Forget the OS choice: the next 'start' asks again.
+    Remove-Item $DistroFile -Force -ErrorAction SilentlyContinue
 
     if ($Purge -and (Test-Path $LabPath)) {
         Write-Step "Purging $LabPath"
-        if (Test-Path $BaseVhdx) { Set-ItemProperty $BaseVhdx -Name IsReadOnly -Value $false }
+        # Base disks (one per OS) are marked read-only; clear that so they can be deleted.
+        Get-ChildItem "$ImgDir\*-base.vhdx" -ErrorAction SilentlyContinue |
+            ForEach-Object { Set-ItemProperty $_.FullName -Name IsReadOnly -Value $false }
         Remove-Item $LabPath -Recurse -Force
     }
     Write-Ok 'Done.'
